@@ -2,17 +2,11 @@ import requests
 from bs4 import BeautifulSoup
 
 def main():
-    links=[]
-    # links.append(get_routes("https://www.mountainproject.com/area/123696872/broomfield-boulders"))
-    print(links)
+    routes = []
+    routes = get_areas(requests.get("https://www.mountainproject.com/area/113745735/cross-mountain-boulders"))
+    print(routes)
 
-    areas_co = get_areas("https://www.mountainproject.com/area/105708956/colorado")
-    print(areas_co)
-    # for area in areas_co:
-    #     print(get_routes(area))
-
-def get_areas(base_url):
-    page = requests.get(base_url)
+def get_areas(page):
     soup = BeautifulSoup(page.content, "html.parser")
     sidebar = soup.find("div", class_="mp-sidebar")
     areas_table = sidebar.find_all("div", class_="lef-nav-row")
@@ -21,23 +15,27 @@ def get_areas(base_url):
     for arearow in areas_table:
         area_links.append(arearow.find("a")["href"])
 
-    
-    # for location in areas_table:
-    #     area_links.append(location["href"])
-
-    for link in areas_table:
+    routes = []
+    for link in area_links:
         sub_page = requests.get(link)
+        soup = BeautifulSoup(sub_page.content, "html.parser")
+        route_table = soup.find("table", id="left-nav-route-table")
         
+        if route_table == None:
+            routes.extend(get_areas(sub_page))
+        else:
+            routes.extend(get_routes(sub_page))
 
 
-    return area_links
+    return routes
 
-def get_routes(base_url):
-    page = requests.get(base_url)
+def get_routes(page):
     soup = BeautifulSoup(page.content, "html.parser")
 
-    routes_table = soup.find_all("table", id="left-nav-route-table")[0]
-
+    routes_table = soup.find("table", id="left-nav-route-table")
+    if routes_table == None:
+        return [] 
+    
     route_links = []
     route_names = []
     for location in routes_table:
@@ -47,8 +45,7 @@ def get_routes(base_url):
         
         route_links.append(atag["href"])
         route_names.append(atag.text)
-    print(route_names)
-    return route_links
+    return route_names
 
 if __name__ == "__main__":
     main()
