@@ -7,6 +7,7 @@ def main():
     routes = get_areas(requests.get("https://www.mountainproject.com/area/113745735/cross-mountain-boulders"))
     print(routes)
 
+
 def get_areas(page):
     soup = BeautifulSoup(page.content, "html.parser")
     sidebar = soup.find("div", class_="mp-sidebar")
@@ -27,8 +28,8 @@ def get_areas(page):
         else:
             routes.extend(get_routes(sub_page))
 
-
     return routes
+
 
 def get_routes(page):
     soup = BeautifulSoup(page.content, "html.parser")
@@ -43,26 +44,34 @@ def get_routes(page):
         atag = location.find("a")
         if atag == -1 or atag == None:
             continue
-        
-        route_info = {}
-        route_info["name"] = atag.text
-        route_info["link"] = atag["href"]
-        get_route_info(requests.get(route_info["link"]))
 
-        all_route_info.append(route_info)
+        link = atag["href"]
         
+        all_route_info.append(get_route_info(requests.get(link)))
+
     return all_route_info
+
 
 def get_route_info(page):
     soup = BeautifulSoup(page.content, "html.parser")
+    
+    name = soup.find("h1").text.strip(" \n")
+
     rating = soup.find("span", class_="scoreStars").parent
     rating = rating.text
-    print(rating)
     rating = re.findall(r"(\d*\.?\d+)", rating)
-    print(rating )
-    rating_avg = rating[0]
-    rating_count = rating[1]
-    print(rating_avg, rating_count)
+    
+    grade = soup.find("span", class_="rateYDS").text
+    grade = re.search(r"[^Y][^D][^S]", grade).group().strip()
+
+    route_info = {}
+    route_info["avg_rating"] = rating[0]
+    route_info["rating_count"] = rating[1]
+    route_info["name"] = name
+    route_info["grade"] = grade
+
+    return route_info
+
 
 if __name__ == "__main__":
     main()
