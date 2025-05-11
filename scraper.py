@@ -1,5 +1,6 @@
 import requests
 from bs4 import BeautifulSoup
+import re
 
 def main():
     routes = []
@@ -35,17 +36,33 @@ def get_routes(page):
     routes_table = soup.find("table", id="left-nav-route-table")
     if routes_table == None:
         return [] 
+
+    all_route_info = []
     
-    route_links = []
-    route_names = []
     for location in routes_table:
         atag = location.find("a")
         if atag == -1 or atag == None:
             continue
         
-        route_links.append(atag["href"])
-        route_names.append(atag.text)
-    return route_names
+        route_info = {}
+        route_info["name"] = atag.text
+        route_info["link"] = atag["href"]
+        get_route_info(requests.get(route_info["link"]))
+
+        all_route_info.append(route_info)
+        
+    return all_route_info
+
+def get_route_info(page):
+    soup = BeautifulSoup(page.content, "html.parser")
+    rating = soup.find("span", class_="scoreStars").parent
+    rating = rating.text
+    print(rating)
+    rating = re.findall(r"(\d*\.?\d+)", rating)
+    print(rating )
+    rating_avg = rating[0]
+    rating_count = rating[1]
+    print(rating_avg, rating_count)
 
 if __name__ == "__main__":
     main()
