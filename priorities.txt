@@ -1,0 +1,3 @@
+1. Threadpooling because im pretty sure this is IO bound
+2. Indent stdout by one space for each level deeper into the recursion. Can pass depth with the function calls which could also do a check to insure it isn't indenting like 50 times
+3. Add a progress bar. Scrape the total number of routes at the top level. Thne count total number of routes and use that for progress bar. 
