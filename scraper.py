@@ -5,18 +5,28 @@ from utils import bcolors
 import logging
 from time import sleep
 import datetime
+import concurrent.futures
+import sys
+from pathlib import Path
 
-ROOT_LINK="https://www.mountainproject.com/area/105744222/boulder-canyon"
 http_session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_maxsize=10)
+http_session.mount('https://', adapter)
+
 total_routes = 0
+root_link="https://www.mountainproject.com/area/105797700/flatirons"
+
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
 def main():
+    fname = Path(sys.argv[1])
+
     dt = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S.f%z")
     logging.basicConfig(filename=f"./logs/{dt}_scrape.log", level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
     routes = []
-    routes = get_areas(http_session.get(ROOT_LINK), ROOT_LINK)
-    with open("data/routes.json", "w") as fp:
+    routes = get_areas(http_session.get(root_link), root_link)
+    with open(f"./data/{fname}.json", "w") as fp:
         json.dump(routes, fp)
 
 
@@ -62,7 +72,7 @@ def get_areas(page, link):
             logging.warning("GET %s failed with code %s", sub_link, sub_page.status_code)
             sleep(timeout)
             timeout = timeout*2
-            ties += 1 
+            tries += 1 
         if tries >= 6: 
             logging.error("GET %s exceeded number of retries", sub_link)
             return []
@@ -96,33 +106,34 @@ def get_routes(page, link):
         return [] 
 
     all_route_info = []
+    futures = []
     for location in routes_table:
-#        if atag == None:
- #           logging.error("Could not find link for an unknown route in %s", link)
-  #          continue
-
         sub_link = location["href"]
 
-        tries = 0
-        timeout = 0
-        while tries <= 6:
-            sub_page = http_session.get(sub_link)
-            if sub_page.status_code == 200:
-                break
-            logging.warning("GET %s failed with code %s", sub_link, sub_page.status_code)
-            sleep(timeout)
-            timeout = timeout*2
-            tries+= 1
-        if tries >= 6:
-            logging.error("GET %s exceeded number of retries", sub_link)
-            return []
-
-        all_route_info.append(get_route_info(sub_page, sub_link))
-
+        futures.append(executor.submit(get_route_info, sub_link))
+    
+    for future in futures:
+        route_info = future.result()
+        if route_info != None:
+            all_route_info.append(route_info)
     return all_route_info
 
 
-def get_route_info(page, link):
+def get_route_info(link):
+    tries = 0
+    timeout = 0 
+    while tries <= 6:
+        page = http_session.get(link)
+        if page.status_code == 200:
+            break
+        logging.warning("GET %s failed with code %s", link, page.status_code)
+        sleep(timeout)
+        timeout = timeout*2
+        tries += 1
+    if tries >= 6:
+        logging.error("GET %s exceeded number of retries", link)
+        return
+
     soup = BeautifulSoup(page.content, "html.parser")
     
     name_tag = soup.find("h1")
