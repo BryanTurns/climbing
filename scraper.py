@@ -1,36 +1,90 @@
-import requests
-from bs4 import BeautifulSoup
-import re, json
-from utils import bcolors
-import logging
-from time import sleep
-import datetime
 import concurrent.futures
+import datetime
+import json
+import logging
+import re
+import signal
 import sys
 from pathlib import Path
+from time import sleep
+
+import requests
+from bs4 import BeautifulSoup
 
 http_session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_maxsize=10)
-http_session.mount('https://', adapter)
+http_session.mount("https://", adapter)
 
 total_routes = 0
-root_link="https://www.mountainproject.com/area/105797700/flatirons"
+root_link = "https://www.mountainproject.com/area/105745789/mt-thorodin"
 
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+
+# Routes scraped so far. Populated by get_route_info as each route is
+# fetched so that whatever we have can be persisted if the scrape is
+# interrupted (Ctrl-C, SIGTERM, unhandled exception) before it finishes.
+all_routes = []
+# Flipped by the signal handler so worker functions can bail out early.
+interrupted = False
+
 
 def main():
     fname = Path(sys.argv[1])
 
     dt = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S.f%z")
-    logging.basicConfig(filename=f"./logs/{dt}_scrape.log", level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    
-    routes = []
-    routes = get_areas(http_session.get(root_link), root_link)
-    with open(f"./data/{fname}.json", "w") as fp:
-        json.dump(routes, fp)
+    logging.basicConfig(
+        filename=f"./logs/{dt}_scrape.log",
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
+    # Trigger a graceful shutdown on Ctrl-C / SIGTERM so we still write the
+    # partial results to disk instead of losing the work-in-progress.
+    signal.signal(signal.SIGINT, _handle_interrupt)
+    signal.signal(signal.SIGTERM, _handle_interrupt)
+
+    try:
+        get_areas(http_session.get(root_link), root_link)
+    except KeyboardInterrupt:
+        # If the interrupt lands in pure-Python code the signal handler may
+        # not have flipped the flag yet -- treat it the same and fall
+        # through to the save in `finally`.
+        logging.warning("Scrape interrupted by user (KeyboardInterrupt)")
+    finally:
+        # Cancel queued tasks; let in-flight ones finish so their results
+        # make it into all_routes before we serialize.
+        executor.shutdown(wait=True, cancel_futures=True)
+        _save_routes(fname)
+
+
+def _handle_interrupt(signum, frame):
+    global interrupted
+    if interrupted:
+        # Second signal: restore the default handler so a third press
+        # hard-kills the process in case graceful shutdown is hanging.
+        signal.signal(signum, signal.SIG_DFL)
+        return
+    interrupted = True
+    print(
+        f"\nReceived signal {signum} - finishing in-flight requests and saving partial data..."
+    )
+    logging.warning("Received signal %s - shutting down gracefully", signum)
+
+
+def _save_routes(fname):
+    out_dir = Path("./data")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{fname}.json"
+    with open(out_path, "w") as fp:
+        json.dump(all_routes, fp)
+    msg = f"Saved {len(all_routes)} routes to {out_path}"
+    print(msg)
+    logging.info(msg)
 
 
 def get_areas(page, link):
+    if interrupted:
+        return []
     soup = BeautifulSoup(page.content, "html.parser")
 
     area_tag = soup.find("h1")
@@ -63,17 +117,22 @@ def get_areas(page, link):
 
     routes = []
     for sub_link in area_links:
+        if interrupted:
+            logging.warning("Interrupt flag set - aborting area iteration in %s", link)
+            break
         tries = 0
         timeout = 0.1
         while tries <= 6:
             sub_page = http_session.get(sub_link)
             if sub_page.status_code == 200:
-                 break
-            logging.warning("GET %s failed with code %s", sub_link, sub_page.status_code)
+                break
+            logging.warning(
+                "GET %s failed with code %s", sub_link, sub_page.status_code
+            )
             sleep(timeout)
-            timeout = timeout*2
-            tries += 1 
-        if tries >= 6: 
+            timeout = timeout * 2
+            tries += 1
+        if tries >= 6:
             logging.error("GET %s exceeded number of retries", sub_link)
             return []
 
@@ -88,8 +147,10 @@ def get_areas(page, link):
 
 
 def get_routes(page, link):
+    if interrupted:
+        return []
     soup = BeautifulSoup(page.content, "html.parser")
-    
+
     area_tag = soup.find("h1")
     area_name = ""
     if area_tag != None:
@@ -103,39 +164,52 @@ def get_routes(page, link):
     routes_table = soup.find("table", id="left-nav-route-table").find_all("a")
     if routes_table == None:
         logging.error("Could not find route table for %s", link)
-        return [] 
+        return []
 
     all_route_info = []
     futures = []
     for location in routes_table:
+        if interrupted:
+            break
         sub_link = location["href"]
 
         futures.append(executor.submit(get_route_info, sub_link))
-    
+
     for future in futures:
-        route_info = future.result()
+        if interrupted:
+            # Cancel anything that hasn't started yet; running tasks will
+            # finish on their own and append to the global all_routes.
+            future.cancel()
+            continue
+        try:
+            route_info = future.result()
+        except Exception:
+            logging.exception("Route fetch failed in %s", link)
+            continue
         if route_info != None:
             all_route_info.append(route_info)
     return all_route_info
 
 
 def get_route_info(link):
+    if interrupted:
+        return
     tries = 0
-    timeout = 0 
+    timeout = 1
     while tries <= 6:
         page = http_session.get(link)
         if page.status_code == 200:
             break
         logging.warning("GET %s failed with code %s", link, page.status_code)
         sleep(timeout)
-        timeout = timeout*2
+        timeout = timeout * 2
         tries += 1
     if tries >= 6:
         logging.error("GET %s exceeded number of retries", link)
         return
 
     soup = BeautifulSoup(page.content, "html.parser")
-    
+
     name_tag = soup.find("h1")
     name = ""
     if name_tag != None:
@@ -158,7 +232,7 @@ def get_route_info(link):
         grade = re.search(r"[^Y][^D][^S]", grade)
         if grade != None:
             grade = grade.group().strip()
-        else: 
+        else:
             logging.warning("Could not parse grade for route %s", link)
     else:
         logging.warning("Could not find grade for route %s", link)
@@ -170,6 +244,9 @@ def get_route_info(link):
     route_info["grade"] = grade
     route_info["link"] = link
 
+    # Append to the module-level list so the route is captured even if the
+    # scrape is interrupted before we get back to main().
+    all_routes.append(route_info)
     return route_info
 
 
