@@ -230,9 +230,16 @@ def _parse_description_details(soup):
             #   "Sport, TR, 50 ft (15 m) Fixed Hardware (4)"
             #   "Trad, 5 pitches, 600 ft (182 m)"
             #   "Boulder"  (no height)
+            #   "Sport Fixed Hardware (7)"  (no height, no comma)
             # The height pattern anchors the split: anything before it is a
             # comma-separated list of climbing styles, anything after is
-            # decoration (Fixed Hardware link, etc.) we ignore.
+            # decoration (Fixed Hardware link, etc.) we ignore. Strip the
+            # "Fixed Hardware (N)" decoration up front so it doesn't trip
+            # the digit-skip filter below when there's no height to anchor
+            # against (e.g. a bare "Sport Fixed Hardware (7)").
+            value_text = re.sub(
+                r"\s*Fixed Hardware\s*\(\s*\d+\s*\)\s*", " ", value_text
+            ).strip()
             height_match = re.search(
                 r"(\d[\d,]*)\s*ft\s*\(\s*(\d[\d,]*)\s*m\s*\)", value_text
             )
