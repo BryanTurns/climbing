@@ -1,3 +1,4 @@
+import argparse
 import concurrent.futures
 import datetime
 import json
@@ -12,13 +13,11 @@ import requests
 from bs4 import BeautifulSoup
 
 http_session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(pool_maxsize=10)
-http_session.mount("https://", adapter)
 
 total_routes = 0
-root_link = "https://www.mountainproject.com/area/105745789/mt-thorodin"
 
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+# Initialized in main() once we know the requested thread pool size.
+executor = None
 
 # Routes scraped so far. Populated by get_route_info as each route is
 # fetched so that whatever we have can be persisted if the scrape is
@@ -30,9 +29,65 @@ all_route_areas = []
 # Flipped by the signal handler so worker functions can bail out early.
 interrupted = False
 
+DEFAULT_THREADS = 10
+DEFAULT_OUTPUT_FILE = "data.json"
+
+
+def _positive_int(value):
+    """argparse `type` for thread pool size: must be an int >= 1."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be an integer (got {value!r})")
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1 (got {n})")
+    return n
+
+
+def _parse_args(argv):
+    """Parse CLI args. Returns (filename, root_link, thread_pool_size)."""
+    parser = argparse.ArgumentParser(
+        prog="scraper.py",
+        description="Scrape Mountain Project routes under a given area.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-file",
+        default=DEFAULT_OUTPUT_FILE,
+        help=(
+            "output filename, used as-is (no extension is appended); "
+            f"written under ./data/ (default: {DEFAULT_OUTPUT_FILE})"
+        ),
+    )
+    parser.add_argument(
+        "-l",
+        "--root-link",
+        required=True,
+        help="root Mountain Project area URL to start scraping from",
+    )
+    parser.add_argument(
+        "-t",
+        "--threads",
+        type=_positive_int,
+        default=DEFAULT_THREADS,
+        help=f"size of the thread pool (default: {DEFAULT_THREADS})",
+    )
+    args = parser.parse_args(argv)
+    return args.output_file, args.root_link, args.threads
+
 
 def main():
-    fname = Path(sys.argv[1])
+    global executor
+
+    fname, root_link, threads = _parse_args(sys.argv[1:])
+    fname = Path(fname)
+
+    # Match the HTTP connection pool to the thread pool so workers don't
+    # contend over a fixed-size connection pool when -t is large.
+    adapter = requests.adapters.HTTPAdapter(pool_maxsize=threads)
+    http_session.mount("https://", adapter)
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
 
     dt = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S.f%z")
     logging.basicConfig(
@@ -77,7 +132,7 @@ def _handle_interrupt(signum, frame):
 def _save_routes(fname):
     out_dir = Path("./data")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{fname}.json"
+    out_path = out_dir / fname
     output = {
         "route_areas": all_route_areas,
         "routes": all_routes,
