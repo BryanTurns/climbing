@@ -24,6 +24,9 @@ executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 # fetched so that whatever we have can be persisted if the scrape is
 # interrupted (Ctrl-C, SIGTERM, unhandled exception) before it finishes.
 all_routes = []
+# Route areas (the leaf areas that contain routes) scraped so far. Each
+# entry has the area's name, link, GPS coordinates, and page views.
+all_route_areas = []
 # Flipped by the signal handler so worker functions can bail out early.
 interrupted = False
 
@@ -75,11 +78,133 @@ def _save_routes(fname):
     out_dir = Path("./data")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{fname}.json"
+    output = {
+        "route_areas": all_route_areas,
+        "routes": all_routes,
+    }
     with open(out_path, "w") as fp:
-        json.dump(all_routes, fp)
-    msg = f"Saved {len(all_routes)} routes to {out_path}"
+        json.dump(output, fp)
+    msg = (
+        f"Saved {len(all_routes)} routes across {len(all_route_areas)} "
+        f"route areas to {out_path}"
+    )
     print(msg)
     logging.info(msg)
+
+
+def _parse_description_details(soup):
+    """Pull every field we care about out of the ``description-details``
+    table that Mountain Project renders on both area and route pages.
+
+    Returns a dict with the union of fields seen on areas and routes:
+
+    * ``gps``: ``{"lat": float, "lon": float}`` or ``None``
+    * ``page_views_total`` / ``page_views_per_month``: ``int`` or ``None``
+    * ``shared_on``: ``str`` like ``"Dec 31, 2000"`` or ``None``
+    * ``elevation_ft`` / ``elevation_m``: ``int`` or ``None`` (areas only)
+    * ``type``: list of climbing-style strings (``["Sport", "TR"]``) or
+      ``None`` (routes only)
+    * ``height_ft`` / ``height_m``: ``int`` or ``None`` (routes only)
+
+    Missing fields stay ``None`` so a partial scrape still succeeds; the
+    caller picks the keys it needs.
+    """
+    metadata = {
+        "gps": None,
+        "page_views_total": None,
+        "page_views_per_month": None,
+        "shared_on": None,
+        "elevation_ft": None,
+        "elevation_m": None,
+        "type": None,
+        "height_ft": None,
+        "height_m": None,
+    }
+    table = soup.find("table", class_="description-details")
+    if table is None:
+        return metadata
+
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 2:
+            continue
+        label = tds[0].get_text(strip=True)
+        value_text = tds[1].get_text(separator=" ", strip=True)
+
+        if label.startswith("GPS"):
+            m = re.search(r"(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)", value_text)
+            if m:
+                metadata["gps"] = {
+                    "lat": float(m.group(1)),
+                    "lon": float(m.group(2)),
+                }
+        elif label.startswith("Page Views"):
+            # Format: "91,038 total · 295/month"
+            m = re.search(
+                r"([\d,]+)\s*total\D+([\d,]+)\s*/\s*month", value_text
+            )
+            if m:
+                metadata["page_views_total"] = int(m.group(1).replace(",", ""))
+                metadata["page_views_per_month"] = int(
+                    m.group(2).replace(",", "")
+                )
+        elif label.startswith("Shared By"):
+            # Format: "<username> on Dec 31, 2000" (or full month name).
+            m = re.search(
+                r"on\s+([A-Z][a-z]{2,9}\s+\d{1,2},\s+\d{4})", value_text
+            )
+            if m:
+                metadata["shared_on"] = m.group(1)
+        elif label.startswith("Elevation"):
+            # Layout: <td>Elevation:</td><td class="imperial">7,650 ft</td>
+            #         <td class="metric">2,332 m</td>
+            ft_match = re.search(r"([\d,]+)", value_text)
+            if ft_match:
+                metadata["elevation_ft"] = int(
+                    ft_match.group(1).replace(",", "")
+                )
+            if len(tds) >= 3:
+                metric_text = tds[2].get_text(separator=" ", strip=True)
+                m_match = re.search(r"([\d,]+)", metric_text)
+                if m_match:
+                    metadata["elevation_m"] = int(
+                        m_match.group(1).replace(",", "")
+                    )
+        elif label.startswith("Type"):
+            # Format examples:
+            #   "Sport, TR, 50 ft (15 m) Fixed Hardware (4)"
+            #   "Trad, 5 pitches, 600 ft (182 m)"
+            #   "Boulder"  (no height)
+            # The height pattern anchors the split: anything before it is a
+            # comma-separated list of climbing styles, anything after is
+            # decoration (Fixed Hardware link, etc.) we ignore.
+            height_match = re.search(
+                r"(\d[\d,]*)\s*ft\s*\(\s*(\d[\d,]*)\s*m\s*\)", value_text
+            )
+            if height_match:
+                metadata["height_ft"] = int(
+                    height_match.group(1).replace(",", "")
+                )
+                metadata["height_m"] = int(
+                    height_match.group(2).replace(",", "")
+                )
+                types_text = value_text[: height_match.start()]
+            else:
+                types_text = value_text
+
+            types = []
+            for part in types_text.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                # Tokens with digits are pitch counts ("5 pitches"), boulder
+                # grades ("V0"), aid ratings ("A1"), etc. -- not styles.
+                if any(ch.isdigit() for ch in part):
+                    continue
+                types.append(part)
+            if types:
+                metadata["type"] = types
+    return metadata
 
 
 def get_areas(page, link):
@@ -161,6 +286,29 @@ def get_routes(page, link):
         logging.warning("Could not determine area name for %s", link)
     print(f"Processing Route Area: {area_name}")
 
+    metadata = _parse_description_details(soup)
+    if metadata["gps"] is None:
+        logging.warning("Could not parse GPS for route area %s", link)
+    if metadata["page_views_per_month"] is None:
+        logging.warning("Could not parse Page Views for route area %s", link)
+    if metadata["shared_on"] is None:
+        logging.warning("Could not parse Shared By date for route area %s", link)
+    if metadata["elevation_ft"] is None:
+        logging.warning("Could not parse Elevation for route area %s", link)
+
+    all_route_areas.append(
+        {
+            "name": area_name,
+            "link": link,
+            "gps": metadata["gps"],
+            "page_views_total": metadata["page_views_total"],
+            "page_views_per_month": metadata["page_views_per_month"],
+            "shared_on": metadata["shared_on"],
+            "elevation_ft": metadata["elevation_ft"],
+            "elevation_m": metadata["elevation_m"],
+        }
+    )
+
     routes_table = soup.find("table", id="left-nav-route-table").find_all("a")
     if routes_table == None:
         logging.error("Could not find route table for %s", link)
@@ -173,7 +321,9 @@ def get_routes(page, link):
             break
         sub_link = location["href"]
 
-        futures.append(executor.submit(get_route_info, sub_link))
+        futures.append(
+            executor.submit(get_route_info, sub_link, area_name, link)
+        )
 
     for future in futures:
         if interrupted:
@@ -191,7 +341,7 @@ def get_routes(page, link):
     return all_route_info
 
 
-def get_route_info(link):
+def get_route_info(link, route_area_name, route_area_link):
     if interrupted:
         return
     tries = 0
@@ -237,12 +387,28 @@ def get_route_info(link):
     else:
         logging.warning("Could not find grade for route %s", link)
 
+    metadata = _parse_description_details(soup)
+    if metadata["page_views_per_month"] is None:
+        logging.warning("Could not parse Page Views for route %s", link)
+    if metadata["shared_on"] is None:
+        logging.warning("Could not parse Shared By date for route %s", link)
+    if metadata["type"] is None:
+        logging.warning("Could not parse Type for route %s", link)
+
     route_info = {}
     route_info["avg_rating"] = rating[0]
     route_info["rating_count"] = rating[1]
     route_info["name"] = name
     route_info["grade"] = grade
     route_info["link"] = link
+    route_info["route_area"] = route_area_name
+    route_info["route_area_link"] = route_area_link
+    route_info["type"] = metadata["type"]
+    route_info["height_ft"] = metadata["height_ft"]
+    route_info["height_m"] = metadata["height_m"]
+    route_info["page_views_total"] = metadata["page_views_total"]
+    route_info["page_views_per_month"] = metadata["page_views_per_month"]
+    route_info["shared_on"] = metadata["shared_on"]
 
     # Append to the module-level list so the route is captured even if the
     # scrape is interrupted before we get back to main().
