@@ -93,21 +93,32 @@ def _save_routes(fname):
 
 
 def _parse_description_details(soup):
-    """Pull GPS coordinates, page views, and the shared-by date out of the
-    description-details table that Mountain Project renders on every area
-    and route page.
+    """Pull every field we care about out of the ``description-details``
+    table that Mountain Project renders on both area and route pages.
 
-    Returns a dict with keys ``gps`` (``{"lat": float, "lon": float}`` or
-    ``None``), ``page_views_total`` (``int`` or ``None``),
-    ``page_views_per_month`` (``int`` or ``None``), and ``shared_on``
-    (``str`` like ``"Dec 31, 2000"`` or ``None``). Missing fields stay
-    ``None`` so a partial scrape still succeeds.
+    Returns a dict with the union of fields seen on areas and routes:
+
+    * ``gps``: ``{"lat": float, "lon": float}`` or ``None``
+    * ``page_views_total`` / ``page_views_per_month``: ``int`` or ``None``
+    * ``shared_on``: ``str`` like ``"Dec 31, 2000"`` or ``None``
+    * ``elevation_ft`` / ``elevation_m``: ``int`` or ``None`` (areas only)
+    * ``type``: list of climbing-style strings (``["Sport", "TR"]``) or
+      ``None`` (routes only)
+    * ``height_ft`` / ``height_m``: ``int`` or ``None`` (routes only)
+
+    Missing fields stay ``None`` so a partial scrape still succeeds; the
+    caller picks the keys it needs.
     """
     metadata = {
         "gps": None,
         "page_views_total": None,
         "page_views_per_month": None,
         "shared_on": None,
+        "elevation_ft": None,
+        "elevation_m": None,
+        "type": None,
+        "height_ft": None,
+        "height_m": None,
     }
     table = soup.find("table", class_="description-details")
     if table is None:
@@ -144,6 +155,55 @@ def _parse_description_details(soup):
             )
             if m:
                 metadata["shared_on"] = m.group(1)
+        elif label.startswith("Elevation"):
+            # Layout: <td>Elevation:</td><td class="imperial">7,650 ft</td>
+            #         <td class="metric">2,332 m</td>
+            ft_match = re.search(r"([\d,]+)", value_text)
+            if ft_match:
+                metadata["elevation_ft"] = int(
+                    ft_match.group(1).replace(",", "")
+                )
+            if len(tds) >= 3:
+                metric_text = tds[2].get_text(separator=" ", strip=True)
+                m_match = re.search(r"([\d,]+)", metric_text)
+                if m_match:
+                    metadata["elevation_m"] = int(
+                        m_match.group(1).replace(",", "")
+                    )
+        elif label.startswith("Type"):
+            # Format examples:
+            #   "Sport, TR, 50 ft (15 m) Fixed Hardware (4)"
+            #   "Trad, 5 pitches, 600 ft (182 m)"
+            #   "Boulder"  (no height)
+            # The height pattern anchors the split: anything before it is a
+            # comma-separated list of climbing styles, anything after is
+            # decoration (Fixed Hardware link, etc.) we ignore.
+            height_match = re.search(
+                r"(\d[\d,]*)\s*ft\s*\(\s*(\d[\d,]*)\s*m\s*\)", value_text
+            )
+            if height_match:
+                metadata["height_ft"] = int(
+                    height_match.group(1).replace(",", "")
+                )
+                metadata["height_m"] = int(
+                    height_match.group(2).replace(",", "")
+                )
+                types_text = value_text[: height_match.start()]
+            else:
+                types_text = value_text
+
+            types = []
+            for part in types_text.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                # Tokens with digits are pitch counts ("5 pitches"), boulder
+                # grades ("V0"), aid ratings ("A1"), etc. -- not styles.
+                if any(ch.isdigit() for ch in part):
+                    continue
+                types.append(part)
+            if types:
+                metadata["type"] = types
     return metadata
 
 
@@ -231,6 +291,10 @@ def get_routes(page, link):
         logging.warning("Could not parse GPS for route area %s", link)
     if metadata["page_views_per_month"] is None:
         logging.warning("Could not parse Page Views for route area %s", link)
+    if metadata["shared_on"] is None:
+        logging.warning("Could not parse Shared By date for route area %s", link)
+    if metadata["elevation_ft"] is None:
+        logging.warning("Could not parse Elevation for route area %s", link)
 
     all_route_areas.append(
         {
@@ -239,6 +303,9 @@ def get_routes(page, link):
             "gps": metadata["gps"],
             "page_views_total": metadata["page_views_total"],
             "page_views_per_month": metadata["page_views_per_month"],
+            "shared_on": metadata["shared_on"],
+            "elevation_ft": metadata["elevation_ft"],
+            "elevation_m": metadata["elevation_m"],
         }
     )
 
@@ -325,6 +392,8 @@ def get_route_info(link, route_area_name, route_area_link):
         logging.warning("Could not parse Page Views for route %s", link)
     if metadata["shared_on"] is None:
         logging.warning("Could not parse Shared By date for route %s", link)
+    if metadata["type"] is None:
+        logging.warning("Could not parse Type for route %s", link)
 
     route_info = {}
     route_info["avg_rating"] = rating[0]
@@ -334,6 +403,9 @@ def get_route_info(link, route_area_name, route_area_link):
     route_info["link"] = link
     route_info["route_area"] = route_area_name
     route_info["route_area_link"] = route_area_link
+    route_info["type"] = metadata["type"]
+    route_info["height_ft"] = metadata["height_ft"]
+    route_info["height_m"] = metadata["height_m"]
     route_info["page_views_total"] = metadata["page_views_total"]
     route_info["page_views_per_month"] = metadata["page_views_per_month"]
     route_info["shared_on"] = metadata["shared_on"]
