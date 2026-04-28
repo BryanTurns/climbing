@@ -434,9 +434,13 @@ def get_route_info(link, route_area_name, route_area_link):
     grade = ""
     if grade_tag != None:
         grade = grade_tag.text
-        grade = re.search(r"[^Y][^D][^S]", grade)
-        if grade != None:
-            grade = grade.group().strip()
+        # Strip the trailing "YDS" label that Mountain Project appends to
+        # the rating text (e.g. "5.10a YDS" -> "5.10a"). The grade itself
+        # never contains Y, D, or S, so everything up to the first such
+        # character is the grade.
+        grade_match = re.search(r"[^YDS]+", grade)
+        if grade_match != None:
+            grade = grade_match.group().strip()
         else:
             logging.warning("Could not parse grade for route %s", link)
     else:
