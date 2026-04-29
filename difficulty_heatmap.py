@@ -26,7 +26,8 @@ from typing import Iterable
 
 import branca.colormap as cm
 import folium
-from folium.plugins import HeatMap
+from branca.element import MacroElement
+from jinja2 import Template
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,115 @@ def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
+# ---------------------------------------------------------------------------
+# Custom Leaflet layer: paint every area's blob into a single shared canvas.
+# ---------------------------------------------------------------------------
+#
+# The previous implementation created one folium ``HeatMap`` (i.e. one
+# Leaflet.heat instance, one canvas, one set of event handlers) per route
+# area.  At ~600 areas that is ~600 canvases all redrawing on every pan/zoom,
+# which freezes the browser.
+#
+# This layer takes the same per-area data — (lat, lon, rgb) — and draws all
+# blobs into ONE canvas in a single pass per redraw.  Visually the result is
+# identical: each blob has a constant hue with alpha fading from centre to
+# edge, just like before.  Off-screen blobs are skipped (viewport culling) and
+# the canvas is sized for high-DPI displays so gradients stay crisp.
+class _BlobsCanvasLayer(MacroElement):
+    """A single canvas overlay that paints N radial-gradient blobs at once."""
+
+    _name = "BlobsCanvasLayer"
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function () {
+            var blobs   = {{ this.blobs | tojson }};
+            var radius  = {{ this.radius }};
+            var map     = {{ this._parent.get_name() }};
+
+            var BlobsLayer = L.Layer.extend({
+                onAdd: function (map) {
+                    this._map = map;
+                    var canvas = this._canvas = L.DomUtil.create(
+                        'canvas', 'leaflet-zoom-hide'
+                    );
+                    canvas.style.pointerEvents = 'none';
+                    map.getPanes().overlayPane.appendChild(canvas);
+                    map.on('moveend resize zoomend', this._reset, this);
+                    this._reset();
+                },
+                onRemove: function (map) {
+                    L.DomUtil.remove(this._canvas);
+                    map.off('moveend resize zoomend', this._reset, this);
+                },
+                _reset: function () {
+                    var map   = this._map;
+                    var size  = map.getSize();
+                    var dpr   = window.devicePixelRatio || 1;
+                    var c     = this._canvas;
+                    // Resize backing store for crisp rendering on retina.
+                    if (c.width  !== size.x * dpr) c.width  = size.x * dpr;
+                    if (c.height !== size.y * dpr) c.height = size.y * dpr;
+                    c.style.width  = size.x + 'px';
+                    c.style.height = size.y + 'px';
+                    // Pin the canvas to the map's current top-left so that
+                    // Leaflet's overlayPane translation moves it with pans
+                    // until we redraw.
+                    var topLeft = map.containerPointToLayerPoint([0, 0]);
+                    L.DomUtil.setPosition(c, topLeft);
+                    this._draw(dpr);
+                },
+                _draw: function (dpr) {
+                    var ctx = this._canvas.getContext('2d');
+                    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    ctx.clearRect(
+                        0, 0, this._canvas.width, this._canvas.height
+                    );
+                    var map = this._map;
+                    // Pad the visible bounds slightly so blobs whose centre
+                    // is just off-screen still paint their visible halo.
+                    var bounds = map.getBounds().pad(0.25);
+                    for (var i = 0; i < blobs.length; i++) {
+                        var b = blobs[i];
+                        var lat = b[0], lon = b[1];
+                        if (lat < bounds.getSouth() || lat > bounds.getNorth()
+                         || lon < bounds.getWest()  || lon > bounds.getEast()) {
+                            continue;
+                        }
+                        var p = map.latLngToContainerPoint([lat, lon]);
+                        var rgb = b[2] + ',' + b[3] + ',' + b[4];
+                        var grad = ctx.createRadialGradient(
+                            p.x, p.y, 0, p.x, p.y, radius
+                        );
+                        // Stops mirror the previous HeatMap gradient: a soft
+                        // falloff from ~0.9 alpha at centre to fully
+                        // transparent at the edge.
+                        grad.addColorStop(0.0, 'rgba(' + rgb + ',0.90)');
+                        grad.addColorStop(0.3, 'rgba(' + rgb + ',0.65)');
+                        grad.addColorStop(0.6, 'rgba(' + rgb + ',0.35)');
+                        grad.addColorStop(1.0, 'rgba(' + rgb + ',0.00)');
+                        ctx.fillStyle = grad;
+                        ctx.fillRect(
+                            p.x - radius, p.y - radius,
+                            radius * 2,   radius * 2
+                        );
+                    }
+                }
+            });
+
+            (new BlobsLayer()).addTo(map);
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(self, blobs: list[list], radius: int = 80) -> None:
+        super().__init__()
+        self.blobs = blobs
+        self.radius = radius
+
+
 def build_heatmap(rows: list[dict], output_path: str | Path) -> Path:
     if not rows:
         raise ValueError("No sport route areas with valid YDS grades were found.")
@@ -225,6 +335,10 @@ def build_heatmap(rows: list[dict], output_path: str | Path) -> Path:
         location=[center_lat, center_lon],
         zoom_start=14,
         tiles="OpenStreetMap",
+        # Render CircleMarkers (and any other vector layers) onto a single
+        # shared canvas instead of one SVG element each.  Important when we
+        # have hundreds of click-target dots.
+        prefer_canvas=True,
     )
 
     # Map each area's mean difficulty to a single hue using a colormap whose
@@ -283,6 +397,7 @@ def build_heatmap(rows: list[dict], output_path: str | Path) -> Path:
             max_zoom=1,  # treat the intensity as already normalised
             gradient=single_hue_gradient,
         ).add_to(fmap)
+
 
     # A small black dot at each area's GPS point makes the source obvious
     # and gives a click target for the popup.  Pack every area into a
