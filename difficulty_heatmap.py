@@ -27,6 +27,7 @@ from typing import Iterable
 import branca.colormap as cm
 import folium
 from branca.element import MacroElement
+from folium.plugins import HeatMap
 from jinja2 import Template
 
 
