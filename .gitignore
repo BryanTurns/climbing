@@ -1,6 +1,7 @@
 venv
 __pycache__/
 logs/
+data/
 
 # Generated Folium maps (regenerable from the scripts in this repo)
 *.html
