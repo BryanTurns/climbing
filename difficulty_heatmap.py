@@ -108,6 +108,58 @@ def yds_to_numeric(grade: str | None) -> float | None:
     return float(score)
 
 
+def numeric_to_yds(score: float | None) -> str:
+    """Translate a numeric difficulty back into a human-readable YDS grade.
+
+    The numeric scale is an internal aggregation tool only; nothing the user
+    sees should display it.  Averaged scores rarely land on an exact grade
+    boundary, so we round to the nearest integer slot before converting.
+    """
+    if score is None:
+        return "?"
+
+    # ``MAX_NUMERIC`` is a float (because LETTER_OFFSET is), so coerce back
+    # to int after clamping so we can use the result as a list index.
+    rounded = int(max(MIN_NUMERIC, min(MAX_NUMERIC, int(round(score)))))
+
+    major = rounded // 4
+    letter_idx = rounded % 4
+
+    # 5.0 .. 5.9 don't use letter suffixes.
+    if major < 10:
+        return f"5.{major}"
+    return f"5.{major}{['a', 'b', 'c', 'd'][letter_idx]}"
+
+
+# The colormap's *visible* domain.  The full YDS range still defines what's
+# a valid grade (MIN/MAX_NUMERIC), but the color gradient is focused on the
+# band that contains the vast majority of climbers.  Areas outside this band
+# saturate to the gradient endpoints — branca's LinearColormap clamps inputs
+# below vmin / above vmax to the endpoint colors automatically, so no extra
+# code is needed to handle the tails.  Hard-coded (not derived from data)
+# so that two crags with the same mean grade always render in the same
+# colour, regardless of which JSON files happen to be loaded.
+SCALE_MIN_GRADE = "5.7"
+SCALE_MAX_GRADE = "5.14d"
+SCALE_MIN_NUMERIC = yds_to_numeric(SCALE_MIN_GRADE)   # 28.0
+SCALE_MAX_NUMERIC = yds_to_numeric(SCALE_MAX_GRADE)   # 59.0
+
+
+def _quantize_to_bucket(score: float) -> int:
+    """Round a numeric score to its colour bucket.
+
+    Areas in the same bucket get the same colour and can share a single
+    HeatMap layer.  Bucketing on integer numeric slots gives at most ~32
+    buckets across the focused [SCALE_MIN_NUMERIC, SCALE_MAX_NUMERIC]
+    range — far fewer than potentially thousands of areas, which is what
+    keeps the rendered HTML small.  Inputs outside the focused range
+    clamp to the endpoints, matching the colormap's own saturation
+    behaviour.
+    """
+    clamped = max(SCALE_MIN_NUMERIC, min(SCALE_MAX_NUMERIC, score))
+    return int(round(clamped))
+
+
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
@@ -175,30 +227,47 @@ def build_heatmap(rows: list[dict], output_path: str | Path) -> Path:
         tiles="OpenStreetMap",
     )
 
-    # Map each area's mean difficulty to a single hue using a colormap that
-    # spans the full YDS range (5.0 .. 5.15d  =  0 .. 63), NOT the range of
-    # the current data.  Pinning the scale this way means two crags with the
-    # same mean grade always render in the same colour, regardless of which
-    # JSON files happen to be loaded.  The same colormap is added as a
-    # legend so users can read difficulty off colour.
+    # Map each area's mean difficulty to a single hue using a colormap whose
+    # domain is focused on the band where the vast majority of climbers
+    # operate (SCALE_MIN_GRADE .. SCALE_MAX_GRADE).  Easier areas saturate
+    # to the coolest colour; harder areas saturate to the hottest — branca's
+    # LinearColormap.__call__ clamps inputs outside [vmin, vmax] to the
+    # endpoint colours, so no special handling is needed for the tails.
+    # The endpoints are hard-coded YDS grades (not derived from data), so
+    # two crags with the same mean grade always render in the same colour
+    # regardless of which JSON files happen to be loaded.
+    #
+    # We DON'T add this colormap to the map directly: branca renders it with
+    # numeric tick labels, and the internal numeric scale is meant to stay
+    # invisible to the user.  See ``_build_legend_html`` below for the
+    # custom YDS-labelled legend we render instead.
     colormap = cm.LinearColormap(
         DIFFICULTY_COLOURS,
-        vmin=MIN_NUMERIC,            # 5.0
-        vmax=MAX_NUMERIC,            # 5.15d
-        caption=(
-            "Mean YDS score per area  "
-            "(0 = 5.0 · 16 = 5.4 · 36 = 5.9 · 48 = 5.12a · 56 = 5.14a · 63 = 5.15d)"
-        ),
+        vmin=SCALE_MIN_NUMERIC,      # 5.7
+        vmax=SCALE_MAX_NUMERIC,      # 5.14d
     )
 
-    # Render each route area as its OWN HeatMap layer with a single point.
-    # Inside the layer we use a one-colour gradient where only the alpha
-    # changes with intensity:  centre = full-alpha-colour, edge = same colour
-    # but transparent.  Because every stop in the gradient shares the same
-    # RGB, the colour stays constant throughout the blob and only the
-    # transparency fades with distance from the area's GPS point.
+    # Group areas by their colour bucket and emit ONE HeatMap layer per
+    # bucket (capped at ~32) instead of one per area (potentially
+    # thousands).  Each bucket's layer uses a one-colour gradient where
+    # only the alpha changes with intensity: centre = full-alpha-colour,
+    # edge = same colour but transparent.  Because every stop in the
+    # gradient shares the same RGB, every blob in the layer keeps the
+    # bucket's colour and only the transparency fades with distance from
+    # each GPS point.
+    #
+    # Side-effect of folding multiple points into one layer: clusters of
+    # similar-grade crags accumulate alpha and read as a brighter blob in
+    # that hue, which is a useful density cue.  leaflet-heat caps the
+    # accumulated intensity at ``max`` (default 1.0), so the blob stays
+    # at the gradient's maximum opacity rather than washing out.
+    buckets: dict[int, list[list[float]]] = {}
     for row in rows:
-        r, g, b = _hex_to_rgb(colormap(row["mean_difficulty"]))
+        bucket = _quantize_to_bucket(row["mean_difficulty"])
+        buckets.setdefault(bucket, []).append([row["lat"], row["lon"], 1.0])
+
+    for bucket, points in buckets.items():
+        r, g, b = _hex_to_rgb(colormap(bucket))
         single_hue_gradient = {
             0.05: f"rgba({r},{g},{b},0)",     # far edge: transparent
             0.40: f"rgba({r},{g},{b},0.35)",
@@ -207,7 +276,7 @@ def build_heatmap(rows: list[dict], output_path: str | Path) -> Path:
         }
 
         HeatMap(
-            [[row["lat"], row["lon"], 1.0]],
+            points,
             radius=55,   # how far the heat reaches, in pixels
             blur=40,     # softness of the alpha falloff
             min_opacity=0,
@@ -216,33 +285,144 @@ def build_heatmap(rows: list[dict], output_path: str | Path) -> Path:
         ).add_to(fmap)
 
     # A small black dot at each area's GPS point makes the source obvious
-    # and gives a click target for the popup.
+    # and gives a click target for the popup.  Pack every area into a
+    # single GeoJson layer instead of calling ``folium.CircleMarker(...)``
+    # once per area: a per-area call generates ~15 lines of JS in the
+    # rendered HTML, which for thousands of areas is megabytes of script
+    # for the browser to parse.  GeoJson packs the whole set into one
+    # FeatureCollection plus one ``pointToLayer`` callback.  Popups must
+    # show YDS grades, never the internal numeric score.
+    features = []
     for row in rows:
-        popup = folium.Popup(
-            (
-                f"<b>{row['name']}</b><br>"
-                f"Sport routes: {row['n_routes']}<br>"
-                f"Mean YDS score: {row['mean_difficulty']:.1f}<br>"
-                f"Range: {row['min_difficulty']:.1f} – {row['max_difficulty']:.1f}"
-            ),
-            max_width=320,
+        mean_yds = numeric_to_yds(row["mean_difficulty"])
+        min_yds = numeric_to_yds(row["min_difficulty"])
+        max_yds = numeric_to_yds(row["max_difficulty"])
+        grade_range = (
+            min_yds if min_yds == max_yds else f"{min_yds} – {max_yds}"
         )
-        folium.CircleMarker(
-            location=[row["lat"], row["lon"]],
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [row["lon"], row["lat"]],
+                },
+                "properties": {
+                    "name": row["name"],
+                    "n_routes": row["n_routes"],
+                    "mean_grade": mean_yds,
+                    "range": grade_range,
+                },
+            }
+        )
+
+    folium.GeoJson(
+        {"type": "FeatureCollection", "features": features},
+        name="Areas",
+        marker=folium.CircleMarker(
             radius=3,
             color="#222",
             weight=1,
             fill=True,
             fill_color="#222",
             fill_opacity=0.85,
-            popup=popup,
-        ).add_to(fmap)
+        ),
+        popup=folium.GeoJsonPopup(
+            fields=["name", "n_routes", "mean_grade", "range"],
+            aliases=["Area", "Sport routes", "Mean grade", "Range"],
+            max_width=320,
+            localize=False,
+        ),
+    ).add_to(fmap)
 
-    colormap.add_to(fmap)
+    fmap.get_root().html.add_child(folium.Element(_build_legend_html()))
 
     output_path = Path(output_path)
     fmap.save(str(output_path))
     return output_path
+
+
+def _build_legend_html() -> str:
+    """Return an HTML overlay that mirrors the colormap with YDS tick labels.
+
+    We can't reuse branca's built-in legend: it renders ticks from ``vmin``
+    to ``vmax`` as raw numbers, which would expose the internal numeric
+    scale.  Instead, we paint a CSS gradient that matches
+    :data:`DIFFICULTY_COLOURS` and pin a handful of recognisable YDS grades
+    at the same proportional positions they occupy on the (focused)
+    numeric scale.
+    """
+    # Reference grades to label.  Endpoints anchor the bar; the rest cover
+    # the range climbers actually care about.  All ticks must fall inside
+    # [SCALE_MIN_NUMERIC, SCALE_MAX_NUMERIC] — anything outside that band
+    # would map to a position past the gradient and be confusing.
+    tick_grades = [
+        "5.7", "5.8", "5.9", "5.10a", "5.11a", "5.12a", "5.13a", "5.14a", "5.14d",
+    ]
+
+    span = SCALE_MAX_NUMERIC - SCALE_MIN_NUMERIC
+    ticks = []
+    for label in tick_grades:
+        score = yds_to_numeric(label)
+        if score is None:
+            continue
+        if score < SCALE_MIN_NUMERIC or score > SCALE_MAX_NUMERIC:
+            continue
+        pct = (score - SCALE_MIN_NUMERIC) / span * 100
+        ticks.append((label, pct))
+
+    gradient_css = f"linear-gradient(to right, {', '.join(DIFFICULTY_COLOURS)})"
+
+    label_spans = "".join(
+        (
+            f'<span style="position:absolute;left:{pct:.2f}%;'
+            f'transform:translateX(-50%);font-size:11px;color:#222;">{label}</span>'
+        )
+        for label, pct in ticks
+    )
+
+    tick_marks = "".join(
+        (
+            f'<span style="position:absolute;left:{pct:.2f}%;top:0;'
+            f'width:1px;height:6px;background:#444;'
+            f'transform:translateX(-50%);"></span>'
+        )
+        for _, pct in ticks
+    )
+
+    return f"""
+    <div style="
+        position: fixed;
+        bottom: 24px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(255,255,255,0.95);
+        padding: 10px 16px 8px;
+        border: 1px solid #888;
+        border-radius: 4px;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+        z-index: 1000;
+        font-family: sans-serif;
+    ">
+        <div style="text-align:center;font-size:12px;color:#222;margin-bottom:6px;">
+            Mean route difficulty per area (scale focused on 5.7–5.14)
+        </div>
+        <div style="position:relative;width:440px;">
+            <div style="
+                width:100%;
+                height:14px;
+                background:{gradient_css};
+                border:1px solid #ccc;
+            "></div>
+            <div style="position:relative;height:6px;margin-top:0;">
+                {tick_marks}
+            </div>
+            <div style="position:relative;height:16px;margin-top:1px;">
+                {label_spans}
+            </div>
+        </div>
+    </div>
+    """
 
 
 # ---------------------------------------------------------------------------
