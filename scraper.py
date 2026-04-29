@@ -173,10 +173,16 @@ def main():
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
 
     dt = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S.f%z")
+    Path("./logs").mkdir(parents=True, exist_ok=True)
+    # Mirror logs to both the per-run file and stderr so progress is
+    # visible live on the console without losing the durable record.
     logging.basicConfig(
-        filename=f"./logs/{dt}_scrape.log",
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(f"./logs/{dt}_scrape.log"),
+            logging.StreamHandler(),
+        ],
     )
 
     # Trigger a graceful shutdown on Ctrl-C / SIGTERM so we still write the
@@ -210,10 +216,10 @@ def _handle_interrupt(signum, frame):
         signal.signal(signum, signal.SIG_DFL)
         return
     interrupted = True
-    print(
-        f"\nReceived signal {signum} - finishing in-flight requests and saving partial data..."
+    logging.warning(
+        "Received signal %s - finishing in-flight requests and saving partial data",
+        signum,
     )
-    logging.warning("Received signal %s - shutting down gracefully", signum)
 
 
 def _save_routes(fname):
@@ -226,12 +232,12 @@ def _save_routes(fname):
     }
     with open(out_path, "w") as fp:
         json.dump(output, fp)
-    msg = (
-        f"Saved {len(all_routes)} routes across {len(all_route_areas)} "
-        f"route areas to {out_path}"
+    logging.info(
+        "Saved %d routes across %d route areas to %s",
+        len(all_routes),
+        len(all_route_areas),
+        out_path,
     )
-    print(msg)
-    logging.info(msg)
 
 
 def _extract_id(url):
@@ -391,15 +397,25 @@ def get_areas(body, link):
         area_name = area_name.strip(" \n\t")
     else:
         logging.warning("Could not determine area name for %s", link)
-    print(f"Processing Area: {area_name}")
+    logging.info("Processing area: %s (%s)", area_name, link)
 
     sidebar = soup.find("div", class_="mp-sidebar")
     if sidebar == None:
-        logging.warning("Could not locate a sidebar for %s", link)
+        logging.error(
+            "Could not locate a sidebar for %s; abandoning subtree", link
+        )
         return []
     areas_table = sidebar.find_all("div", class_="lef-nav-row")
-    if areas_table == None:
-        logging.warning("Could not locate an areas table for %s", link)
+    if not areas_table:
+        # `find_all` returns [] when nothing matches, never None -- the
+        # previous `== None` check was dead code. We only enter
+        # get_areas when the route table was absent, so a page with
+        # neither sub-areas nor routes is either a markup change or a
+        # genuinely empty area; either way the entire subtree is lost.
+        logging.error(
+            "Could not locate any sub-areas in sidebar for %s; abandoning subtree",
+            link,
+        )
         return []
 
     area_links = []
@@ -419,9 +435,19 @@ def get_areas(body, link):
 
         sub_body = _fetch(sub_link)
         if sub_body is None:
-            # _fetch already logged the reason; preserve the existing
-            # behavior of bailing out of this subtree on permanent
-            # failure rather than silently dropping unknown chunks.
+            # _fetch already logged the network failure; preserve the
+            # existing behavior of bailing out of this subtree on
+            # permanent failure rather than silently dropping unknown
+            # chunks. Surface the cascading data-loss explicitly so the
+            # log makes it obvious that the failure affected more than
+            # the one URL that 5xx'd. Stay quiet during shutdown -- the
+            # interrupt warning at the top is the cause there.
+            if not interrupted:
+                logging.error(
+                    "Abandoning remaining sub-areas of %s after fetch failure on %s",
+                    link,
+                    sub_link,
+                )
             return []
 
         soup = BeautifulSoup(sub_body, "html.parser")
@@ -447,7 +473,7 @@ def get_routes(body, link):
         area_name = area_name.strip(" \n\t")
     else:
         logging.warning("Could not determine area name for %s", link)
-    print(f"Processing Route Area: {area_name}")
+    logging.info("Processing route area: %s (%s)", area_name, link)
 
     metadata = _parse_description_details(soup)
     if metadata["gps"] is None:
@@ -473,9 +499,26 @@ def get_routes(body, link):
         }
     )
 
-    routes_table = soup.find("table", id="left-nav-route-table").find_all("a")
-    if routes_table == None:
-        logging.error("Could not find route table for %s", link)
+    # Re-find the route table here rather than relying on the
+    # `route_table is not None` check in get_areas: the second
+    # BeautifulSoup parse on the same body is independent and a markup
+    # quirk could in principle land us with None on the second pass.
+    # Guard explicitly so we get a clear error log instead of an
+    # AttributeError that would cascade up and abort sibling areas too.
+    routes_table_node = soup.find("table", id="left-nav-route-table")
+    if routes_table_node is None:
+        logging.error(
+            "Route table missing for %s on second parse; no routes recorded",
+            link,
+        )
+        return []
+    routes_table = routes_table_node.find_all("a")
+    if not routes_table:
+        # `find_all` returns [] when nothing matches, never None.
+        logging.error(
+            "Route table for %s contained no route links; no routes recorded",
+            link,
+        )
         return []
 
     all_route_info = []
@@ -510,6 +553,15 @@ def get_route_info(link, route_area_link):
         return
     body = _fetch(link)
     if body is None:
+        # _fetch already logged the underlying GET failure; surface the
+        # data-loss consequence explicitly so a reader of the log can
+        # see which routes were dropped without having to cross-
+        # reference URLs. Suppress during shutdown -- the interrupt
+        # warning at the top covers that case.
+        if not interrupted:
+            logging.error(
+                "Dropping route %s from dataset: page fetch failed", link
+            )
         return
 
     soup = BeautifulSoup(body, "html.parser")
@@ -521,13 +573,26 @@ def get_route_info(link, route_area_link):
     else:
         logging.warning("Could not find name for route %s", link)
 
+    # Rating is required: rating[0]/rating[1] are dereferenced
+    # unconditionally below, so if extraction fails the route gets
+    # dropped via IndexError and the catch-all in get_routes. Detect
+    # the failure modes here so the log records the specific cause
+    # rather than just a generic "fetch failed" with a stack trace.
     rating_tag = soup.find("span", class_="scoreStars")
-    rating = ""
-    if rating_tag != None:
-        rating = rating_tag.parent.text
-        rating = re.findall(r"(\d*\.?\d+)", rating)
-    else:
-        logging.warning("Could not find rating for route %s", link)
+    if rating_tag is None:
+        logging.error(
+            "Dropping route %s from dataset: missing rating element", link
+        )
+        return
+    rating_text = rating_tag.parent.text
+    rating = re.findall(r"(\d*\.?\d+)", rating_text)
+    if len(rating) < 2:
+        logging.error(
+            "Dropping route %s from dataset: could not parse rating from %r",
+            link,
+            rating_text,
+        )
+        return
 
     grade_tag = soup.find("span", class_="rateYDS")
     grade = ""
