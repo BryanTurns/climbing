@@ -479,7 +479,7 @@ def get_routes(body, link):
         sub_link = location["href"]
 
         futures.append(
-            executor.submit(get_route_info, sub_link, area_name, link)
+            executor.submit(get_route_info, sub_link, link)
         )
 
     for future in futures:
@@ -498,7 +498,7 @@ def get_routes(body, link):
     return all_route_info
 
 
-def get_route_info(link, route_area_name, route_area_link):
+def get_route_info(link, route_area_link):
     if interrupted:
         return
     body = _fetch(link)
@@ -553,8 +553,9 @@ def get_route_info(link, route_area_name, route_area_link):
     route_info["name"] = name
     route_info["grade"] = grade
     route_info["link"] = link
-    route_info["route_area"] = route_area_name
-    route_info["route_area_link"] = route_area_link
+    # Routes only carry the parent area's ID; name and link are looked up
+    # from route_areas[] via this foreign key. Keeping them inline would
+    # duplicate the data and let it drift if an area is renamed mid-scrape.
     route_info["route_area_id"] = _extract_id(route_area_link)
     route_info["type"] = metadata["type"]
     route_info["height_ft"] = metadata["height_ft"]

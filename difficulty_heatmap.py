@@ -118,26 +118,40 @@ def is_sport(route: dict) -> bool:
 
 
 def aggregate_by_area(payload: dict) -> list[dict]:
-    """Average sport-route difficulty per area, attaching GPS coordinates."""
-    areas_by_name = {a["name"]: a for a in payload.get("route_areas", [])}
+    """Average sport-route difficulty per area, attaching GPS coordinates.
 
-    scores_by_area: dict[str, list[float]] = {}
+    Aggregation keys on ``route_area_id`` -- the numeric ID embedded in
+    the Mountain Project URL -- rather than the area name. Names are not
+    unique (e.g. multiple crags called "The Slabs"), so keying by name
+    silently merges routes from different areas into one bucket and
+    drops all but one of the matching ``route_areas`` records when
+    building the lookup. The ID is unique by construction.
+    """
+    areas_by_id = {a["id"]: a for a in payload.get("route_areas", []) if a.get("id")}
+
+    scores_by_id: dict[str, list[float]] = {}
     for route in payload.get("routes", []):
         if not is_sport(route):
             continue
         score = yds_to_numeric(route.get("grade"))
         if score is None:
             continue
-        scores_by_area.setdefault(route["route_area"], []).append(score)
+        area_id = route.get("route_area_id")
+        if area_id is None:
+            # Older scrapes (pre route_area_id) won't aggregate; rather
+            # than silently bucketing them under None, drop them.
+            continue
+        scores_by_id.setdefault(area_id, []).append(score)
 
     rows: list[dict] = []
-    for name, scores in scores_by_area.items():
-        area = areas_by_name.get(name)
-        if not area or "gps" not in area:
+    for area_id, scores in scores_by_id.items():
+        area = areas_by_id.get(area_id)
+        if not area or not area.get("gps"):
             continue
         rows.append(
             {
-                "name": name,
+                "id": area_id,
+                "name": area["name"],
                 "lat": area["gps"]["lat"],
                 "lon": area["gps"]["lon"],
                 "mean_difficulty": sum(scores) / len(scores),
