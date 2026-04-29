@@ -7,7 +7,7 @@ import re
 import signal
 import sys
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 
 import requests
 from bs4 import BeautifulSoup
@@ -31,6 +31,89 @@ interrupted = False
 
 DEFAULT_THREADS = 10
 DEFAULT_OUTPUT_FILE = "data.json"
+
+# Per-request safety net for HTTP fetches.
+#
+# (CONNECT_TIMEOUT, READ_TIMEOUT) cap the gap between bytes the
+# `requests` library will wait for. TOTAL_REQUEST_BUDGET caps wall-clock
+# time for the entire transfer -- a server that drips one byte every
+# (READ_TIMEOUT - 1) seconds beats the per-read timeout indefinitely,
+# but cannot beat a deadline check around iter_content. We saw this in
+# practice: a worker hung in `_safe_read` mid-chunk on a Mountain
+# Project LB, with no progress and no error.
+CONNECT_TIMEOUT = 10
+READ_TIMEOUT = 30
+TOTAL_REQUEST_BUDGET = 60
+MAX_RETRIES = 6
+
+
+class _BadStatus(Exception):
+    """Internal sentinel so non-2xx responses follow the same retry
+    path as network errors in :func:`_fetch`."""
+
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.status = status
+
+
+def _fetch(url):
+    """GET ``url`` with timeouts, a wall-clock body budget, and retries
+    on transient failures (network errors and non-2xx responses).
+
+    Returns the response body bytes on success, or ``None`` if all
+    retries are exhausted or the scrape is being interrupted. The
+    underlying connection is always closed (or returned to the pool)
+    before this function returns -- this is what prevents the
+    CLOSE_WAIT leaks we used to see when a response was abandoned
+    mid-body.
+    """
+    backoff = 1
+    for attempt in range(MAX_RETRIES + 1):
+        if interrupted:
+            return None
+        try:
+            return _fetch_once(url)
+        except (requests.exceptions.RequestException, _BadStatus) as e:
+            if attempt >= MAX_RETRIES:
+                logging.error("GET %s exceeded retries: %s", url, e)
+                return None
+            logging.warning(
+                "GET %s attempt %d/%d failed: %s",
+                url,
+                attempt + 1,
+                MAX_RETRIES + 1,
+                e,
+            )
+            sleep(backoff)
+            backoff *= 2
+    return None
+
+
+def _fetch_once(url):
+    """One attempt at fetching ``url``. Raises on any failure (including
+    non-2xx) so the retry path in :func:`_fetch` handles them
+    uniformly. ``stream=True`` plus a manual ``iter_content`` loop is
+    what defeats slow-drip servers that beat the per-read timeout."""
+    deadline = monotonic() + TOTAL_REQUEST_BUDGET
+    with http_session.get(
+        url,
+        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+        stream=True,
+    ) as resp:
+        if resp.status_code != 200:
+            raise _BadStatus(resp.status_code)
+        chunks = []
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if interrupted:
+                # Bail out of the body read fast on shutdown; the
+                # `with` will close the connection on the way out.
+                return None
+            if monotonic() > deadline:
+                raise requests.exceptions.Timeout(
+                    f"total request budget {TOTAL_REQUEST_BUDGET}s exceeded"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 
 def _positive_int(value):
@@ -102,7 +185,11 @@ def main():
     signal.signal(signal.SIGTERM, _handle_interrupt)
 
     try:
-        get_areas(http_session.get(root_link), root_link)
+        root_body = _fetch(root_link)
+        if root_body is None:
+            logging.error("Could not fetch root area %s", root_link)
+        else:
+            get_areas(root_body, root_link)
     except KeyboardInterrupt:
         # If the interrupt lands in pure-Python code the signal handler may
         # not have flipped the flag yet -- treat it the same and fall
@@ -145,6 +232,28 @@ def _save_routes(fname):
     )
     print(msg)
     logging.info(msg)
+
+
+def _extract_id(url):
+    """Return the Mountain Project numeric ID embedded in ``url``, or
+    ``None`` if it can't be parsed.
+
+    URLs are formatted as ``.../area/<id>/<slug>`` for areas and
+    ``.../route/<id>/<slug>`` for routes (e.g.
+    ``https://www.mountainproject.com/area/105814996/yosemite-national-park``).
+    The ID disambiguates entries that share a name -- e.g. there are
+    several "The Nose" routes in the database -- so we keep it as a
+    distinct field on every record rather than parsing it on demand
+    from ``link``.
+
+    Returned as a string to preserve the URL representation exactly and
+    avoid surprises if MP ever changes the ID format.
+    """
+    m = re.search(r"/(?:area|route)/(\d+)", url)
+    if m is None:
+        logging.warning("Could not extract ID from URL %s", url)
+        return None
+    return m.group(1)
 
 
 def _parse_description_details(soup):
@@ -262,10 +371,10 @@ def _parse_description_details(soup):
     return metadata
 
 
-def get_areas(page, link):
+def get_areas(body, link):
     if interrupted:
         return []
-    soup = BeautifulSoup(page.content, "html.parser")
+    soup = BeautifulSoup(body, "html.parser")
 
     area_tag = soup.find("h1")
     area_name = ""
@@ -300,36 +409,28 @@ def get_areas(page, link):
         if interrupted:
             logging.warning("Interrupt flag set - aborting area iteration in %s", link)
             break
-        tries = 0
-        timeout = 0.1
-        while tries <= 6:
-            sub_page = http_session.get(sub_link)
-            if sub_page.status_code == 200:
-                break
-            logging.warning(
-                "GET %s failed with code %s", sub_link, sub_page.status_code
-            )
-            sleep(timeout)
-            timeout = timeout * 2
-            tries += 1
-        if tries >= 6:
-            logging.error("GET %s exceeded number of retries", sub_link)
+
+        sub_body = _fetch(sub_link)
+        if sub_body is None:
+            # _fetch already logged the reason; preserve the existing
+            # behavior of bailing out of this subtree on permanent
+            # failure rather than silently dropping unknown chunks.
             return []
 
-        soup = BeautifulSoup(sub_page.content, "html.parser")
+        soup = BeautifulSoup(sub_body, "html.parser")
         route_table = soup.find("table", id="left-nav-route-table")
         if route_table == None:
-            routes.extend(get_areas(sub_page, sub_link))
+            routes.extend(get_areas(sub_body, sub_link))
         else:
-            routes.extend(get_routes(sub_page, sub_link))
+            routes.extend(get_routes(sub_body, sub_link))
 
     return routes
 
 
-def get_routes(page, link):
+def get_routes(body, link):
     if interrupted:
         return []
-    soup = BeautifulSoup(page.content, "html.parser")
+    soup = BeautifulSoup(body, "html.parser")
 
     area_tag = soup.find("h1")
     area_name = ""
@@ -353,6 +454,7 @@ def get_routes(page, link):
 
     all_route_areas.append(
         {
+            "id": _extract_id(link),
             "name": area_name,
             "link": link,
             "gps": metadata["gps"],
@@ -399,21 +501,11 @@ def get_routes(page, link):
 def get_route_info(link, route_area_name, route_area_link):
     if interrupted:
         return
-    tries = 0
-    timeout = 1
-    while tries <= 6:
-        page = http_session.get(link)
-        if page.status_code == 200:
-            break
-        logging.warning("GET %s failed with code %s", link, page.status_code)
-        sleep(timeout)
-        timeout = timeout * 2
-        tries += 1
-    if tries >= 6:
-        logging.error("GET %s exceeded number of retries", link)
+    body = _fetch(link)
+    if body is None:
         return
 
-    soup = BeautifulSoup(page.content, "html.parser")
+    soup = BeautifulSoup(body, "html.parser")
 
     name_tag = soup.find("h1")
     name = ""
@@ -455,6 +547,7 @@ def get_route_info(link, route_area_name, route_area_link):
         logging.warning("Could not parse Type for route %s", link)
 
     route_info = {}
+    route_info["id"] = _extract_id(link)
     route_info["avg_rating"] = rating[0]
     route_info["rating_count"] = rating[1]
     route_info["name"] = name
@@ -462,6 +555,7 @@ def get_route_info(link, route_area_name, route_area_link):
     route_info["link"] = link
     route_info["route_area"] = route_area_name
     route_info["route_area_link"] = route_area_link
+    route_info["route_area_id"] = _extract_id(route_area_link)
     route_info["type"] = metadata["type"]
     route_info["height_ft"] = metadata["height_ft"]
     route_info["height_m"] = metadata["height_m"]
