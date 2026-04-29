@@ -27,6 +27,7 @@ from typing import Iterable
 import branca.colormap as cm
 import folium
 from branca.element import MacroElement
+from folium.plugins import HeatMap
 from jinja2 import Template
 
 
@@ -348,12 +349,36 @@ def build_heatmap(rows: list[dict], output_path: str | Path) -> Path:
     fmap = folium.Map(
         location=[center_lat, center_lon],
         zoom_start=14,
-        tiles="OpenStreetMap",
+        # Don't let folium auto-attach its default OSM tile layer: that
+        # variant doesn't set a referrerPolicy, so depending on how the
+        # HTML is loaded the browser sends no Referer header and OSM's
+        # tile servers respond 403.  We attach an explicit TileLayer
+        # below that DOES set the policy.
+        tiles=None,
         # Render CircleMarkers (and any other vector layers) onto a single
         # shared canvas instead of one SVG element each.  Important when we
         # have hundreds of click-target dots.
         prefer_canvas=True,
     )
+
+    # OpenStreetMap's tile usage policy expects a valid HTTP Referer on
+    # every tile request; without one, the CDN now serves 403s.  Setting
+    # ``referrer_policy`` here flows through to Leaflet's TileLayer
+    # ``referrerPolicy`` option, which in turn sets ``referrerpolicy`` on
+    # each generated <img> tile element so the browser emits a Referer
+    # header.  ``strict-origin-when-cross-origin`` matches modern browser
+    # defaults: it sends the page's origin to OSM (which is what their
+    # policy wants) without leaking the full URL.
+    folium.TileLayer(
+        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attr=(
+            '&copy; <a href="https://www.openstreetmap.org/copyright">'
+            "OpenStreetMap</a> contributors"
+        ),
+        name="OpenStreetMap",
+        max_zoom=19,
+        referrer_policy="strict-origin-when-cross-origin",
+    ).add_to(fmap)
 
     # Map each area's mean difficulty to a single hue using a colormap whose
     # domain is focused on the band where the vast majority of climbers
