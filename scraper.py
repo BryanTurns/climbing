@@ -594,21 +594,50 @@ def get_route_info(link, route_area_link):
         )
         return
 
-    grade_tag = soup.find("span", class_="rateYDS")
-    grade = ""
-    if grade_tag != None:
-        grade = grade_tag.text
-        # Strip the trailing "YDS" label that Mountain Project appends to
-        # the rating text (e.g. "5.10a YDS" -> "5.10a"). The grade itself
-        # never contains Y, D, or S, so everything up to the first such
-        # character is the grade.
-        grade_match = re.search(r"[^YDS]+", grade)
-        if grade_match != None:
-            grade = grade_match.group().strip()
-        else:
-            logging.warning("Could not parse grade for route %s", link)
-    else:
+    # Mountain Project tags both YDS ratings (e.g. "5.10a") and V-grade
+    # boulder ratings (e.g. "V10") with class="rateYDS" -- the latter is
+    # not a typo on their end, V grades are bucketed under the same
+    # rating-system label. A route can carry both at once: a hard sport
+    # climb that's also a boulder problem (e.g. /route/105764013). The
+    # earlier code took only the first match via `find`, silently
+    # dropping the second grade. Pull every rateYDS span from the route
+    # header and split by leading character so we capture both when
+    # present.
+    #
+    # Scope the lookup to the header's <h2>: the page also renders a
+    # nearby-routes table with one rateYDS span per sibling route, and a
+    # bare `find_all` would happily mix those into this route's grades.
+    # Anchor on the first rateYDS span (the route header is rendered
+    # ahead of the sub-route table) and take its parent's rateYDS
+    # children -- they are the route's own grade columns.
+    #
+    # Strip the trailing "YDS" label that Mountain Project appends to
+    # each rating (e.g. "5.10a YDS" -> "5.10a"). Neither YDS grades nor
+    # V grades contain Y/D/S, so everything up to the first such
+    # character is the grade itself.
+    yds_grade = None
+    boulder_grade = None
+    first_grade_tag = soup.find("span", class_="rateYDS")
+    if first_grade_tag is None:
         logging.warning("Could not find grade for route %s", link)
+        grade_tags = []
+    else:
+        grade_tags = first_grade_tag.parent.find_all(
+            "span", class_="rateYDS", recursive=False
+        )
+    for tag in grade_tags:
+        text = tag.text
+        grade_match = re.search(r"[^YDS]+", text)
+        if grade_match is None:
+            logging.warning(
+                "Could not parse grade %r for route %s", text, link
+            )
+            continue
+        parsed = grade_match.group().strip()
+        if parsed.startswith("V"):
+            boulder_grade = parsed
+        else:
+            yds_grade = parsed
 
     metadata = _parse_description_details(soup)
     if metadata["page_views_per_month"] is None:
@@ -623,7 +652,8 @@ def get_route_info(link, route_area_link):
     route_info["avg_rating"] = rating[0]
     route_info["rating_count"] = rating[1]
     route_info["name"] = name
-    route_info["grade"] = grade
+    route_info["yds_grade"] = yds_grade
+    route_info["boulder_grade"] = boulder_grade
     route_info["link"] = link
     # Routes only carry the parent area's ID; name and link are looked up
     # from route_areas[] via this foreign key. Keeping them inline would

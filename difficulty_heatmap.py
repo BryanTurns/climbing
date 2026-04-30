@@ -256,6 +256,12 @@ def numeric_to_v_grade(score: float | None) -> str:
 class ClimbTypeConfig:
     label: str                                            # display name
     type_token: str                                       # MP route ``type`` token
+    # Which grade field on a route record this climb type reads. Sport
+    # and Trad pull from ``yds_grade``; Boulder pulls from
+    # ``boulder_grade``. Routes that carry both (e.g. a hard sport climb
+    # also rated as a boulder problem) correctly contribute to each
+    # climb type's aggregation through its own field.
+    grade_field: str
     grade_to_numeric: Callable[[str | None], float | None]
     numeric_to_grade: Callable[[float | None], str]
     scale_min_grade: str                                  # colormap vmin
@@ -267,6 +273,7 @@ class ClimbTypeConfig:
 SPORT = ClimbTypeConfig(
     label="Sport",
     type_token="Sport",
+    grade_field="yds_grade",
     grade_to_numeric=yds_to_numeric,
     numeric_to_grade=numeric_to_yds,
     scale_min_grade="5.7",
@@ -281,6 +288,7 @@ SPORT = ClimbTypeConfig(
 TRAD = ClimbTypeConfig(
     label="Trad",
     type_token="Trad",
+    grade_field="yds_grade",
     grade_to_numeric=yds_to_numeric,
     numeric_to_grade=numeric_to_yds,
     # Trad climbers tend to operate at lower grades than sport, so the
@@ -299,6 +307,7 @@ TRAD = ClimbTypeConfig(
 BOULDER = ClimbTypeConfig(
     label="Boulder",
     type_token="Boulder",
+    grade_field="boulder_grade",
     grade_to_numeric=v_grade_to_numeric,
     numeric_to_grade=numeric_to_v_grade,
     scale_min_grade="V0",
@@ -363,7 +372,7 @@ def aggregate_by_area(
     for route in payload.get("routes", []):
         if climb_type.type_token not in (route.get("type") or []):
             continue
-        score = climb_type.grade_to_numeric(route.get("grade"))
+        score = climb_type.grade_to_numeric(route.get(climb_type.grade_field))
         if score is None:
             continue
         area_id = route.get("route_area_id")

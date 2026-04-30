@@ -11,17 +11,17 @@ def general_clean(routes_df):
     return routes_df
 
 def ropes_only(routes_df):
-    routes_df = routes_df.dropna(subset=["grade"])
-    routes_df = routes_df[routes_df["grade"].str.contains(r"^[^V].*", regex=True)]
-    return routes_df
+    return routes_df.dropna(subset=["yds_grade"])
 
 def bouldering_only(routes_df):
-    routes_df = routes_df.dropna(subset=["grade"])
-    routes_df = routes_df[routes_df["grade"].str.startswith("V")]
-    return routes_df
+    # A route can carry both yds_grade and boulder_grade (a sport climb
+    # that's also a boulder problem); we want it included here as long
+    # as a V grade is present, regardless of whether it also has a YDS
+    # rating.
+    return routes_df.dropna(subset=["boulder_grade"])
 
 def translate_boulder_grade(routes_df):
-    routes_df["translated_grade"] = routes_df["grade"].str.removeprefix("V")
+    routes_df["translated_grade"] = routes_df["boulder_grade"].str.removeprefix("V")
     routes_df["translated_grade"] = routes_df["translated_grade"].map(translate_boulder_sign)
     return routes_df
 
