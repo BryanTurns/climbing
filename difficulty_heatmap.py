@@ -1,7 +1,7 @@
 """Render a Folium heatmap of route difficulty per area, toggleable by climb type.
 
 For every JSON file in ``data/`` we, for each supported climb type
-(``Sport``, ``Trad``, ``Boulder``):
+(``Sport``, ``Trad``, ``Top Rope``, ``Boulder``):
   1. keep only routes whose ``type`` includes the climb type's token,
   2. translate each grade to a numeric value (YDS for ropes, V-scale for
      boulders; in both cases a full-grade jump is 4 points and the
@@ -270,19 +270,39 @@ class ClimbTypeConfig:
     legend_subtitle: str                                  # legend header text
 
 
+# All three rope disciplines share the same focused band and tick grades.
+# The colormap, legend, and bucket spacing are therefore visually
+# interchangeable across Sport / Trad / Top Rope: a "5.10a area" reads as
+# the same hue regardless of which climb-type radio is active.  This is
+# deliberately less opinionated than per-discipline bands -- we don't
+# pre-judge whether trad or top-rope crags "should" run easier.  Areas
+# outside the band still render; they just saturate to the gradient
+# endpoints.
+ROPE_SCALE_MIN = "5.7"
+ROPE_SCALE_MAX = "5.14d"
+ROPE_TICK_GRADES = [
+    "5.7", "5.8", "5.9", "5.10a", "5.11a",
+    "5.12a", "5.13a", "5.14a", "5.14d",
+]
+
+
+def _rope_legend_subtitle(discipline: str) -> str:
+    return (
+        f"Mean {discipline} difficulty per area "
+        f"({ROPE_SCALE_MIN}–{ROPE_SCALE_MAX})"
+    )
+
+
 SPORT = ClimbTypeConfig(
     label="Sport",
     type_token="Sport",
     grade_field="yds_grade",
     grade_to_numeric=yds_to_numeric,
     numeric_to_grade=numeric_to_yds,
-    scale_min_grade="5.7",
-    scale_max_grade="5.14d",
-    tick_grades=[
-        "5.7", "5.8", "5.9", "5.10a", "5.11a",
-        "5.12a", "5.13a", "5.14a", "5.14d",
-    ],
-    legend_subtitle="Mean sport-route difficulty per area (5.7–5.14d)",
+    scale_min_grade=ROPE_SCALE_MIN,
+    scale_max_grade=ROPE_SCALE_MAX,
+    tick_grades=ROPE_TICK_GRADES,
+    legend_subtitle=_rope_legend_subtitle("sport-route"),
 )
 
 TRAD = ClimbTypeConfig(
@@ -291,17 +311,25 @@ TRAD = ClimbTypeConfig(
     grade_field="yds_grade",
     grade_to_numeric=yds_to_numeric,
     numeric_to_grade=numeric_to_yds,
-    # Trad climbers tend to operate at lower grades than sport, so the
-    # focused band starts a couple grades lower and tops out earlier.
-    # Areas outside this band still render — they just saturate to the
-    # gradient endpoints.
-    scale_min_grade="5.5",
-    scale_max_grade="5.13a",
-    tick_grades=[
-        "5.5", "5.7", "5.8", "5.9", "5.10a",
-        "5.11a", "5.12a", "5.13a",
-    ],
-    legend_subtitle="Mean trad-route difficulty per area (5.5–5.13a)",
+    scale_min_grade=ROPE_SCALE_MIN,
+    scale_max_grade=ROPE_SCALE_MAX,
+    tick_grades=ROPE_TICK_GRADES,
+    legend_subtitle=_rope_legend_subtitle("trad-route"),
+)
+
+TOP_ROPE = ClimbTypeConfig(
+    label="Top Rope",
+    # Mountain Project uses the short ``TR`` token in route ``type`` lists,
+    # not the spelled-out "Top Rope" — the display label diverges from the
+    # data token here.
+    type_token="TR",
+    grade_field="yds_grade",
+    grade_to_numeric=yds_to_numeric,
+    numeric_to_grade=numeric_to_yds,
+    scale_min_grade=ROPE_SCALE_MIN,
+    scale_max_grade=ROPE_SCALE_MAX,
+    tick_grades=ROPE_TICK_GRADES,
+    legend_subtitle=_rope_legend_subtitle("top-rope"),
 )
 
 BOULDER = ClimbTypeConfig(
@@ -316,7 +344,12 @@ BOULDER = ClimbTypeConfig(
     legend_subtitle="Mean boulder difficulty per area (V0–V12)",
 )
 
-CLIMB_TYPES: list[ClimbTypeConfig] = [SPORT, TRAD, BOULDER]
+# Order matters: it drives the radio-button order in the layer control and
+# determines which climb type is the default-visible layer (the first one
+# that has any data).  Rope disciplines come first in difficulty/share
+# order — Sport, Trad, Top Rope — followed by Boulder which uses a
+# different grade scale.
+CLIMB_TYPES: list[ClimbTypeConfig] = [SPORT, TRAD, TOP_ROPE, BOULDER]
 
 
 def _scale_bounds(climb_type: ClimbTypeConfig) -> tuple[float, float]:
