@@ -42,6 +42,24 @@ from jinja2 import Template
 
 
 # ---------------------------------------------------------------------------
+# Schema version this build of the heatmap consumes
+# ---------------------------------------------------------------------------
+#
+# A heatmap build is tied to exactly one schema version: ``load_all``
+# reads only from ``data/v<SCHEMA_VERSION>/`` and rejects any file inside
+# whose envelope claims a different version. To consume data written by a
+# different scraper revision, check out the matching heatmap revision (or
+# bump this constant here and in scraper.py together, then re-scrape).
+#
+# Mirrors ``scraper.SCHEMA_VERSION`` by intent; the two are independent
+# definitions on purpose so the scraper and heatmap stay decoupled at
+# import time. Operationally they should always match — a mismatch just
+# means no files load (the heatmap looks under a directory the scraper
+# never wrote to, or vice versa) rather than data corruption.
+SCHEMA_VERSION: int = 1
+
+
+# ---------------------------------------------------------------------------
 # YDS -> numeric translation (Sport & Trad)
 # ---------------------------------------------------------------------------
 
@@ -914,9 +932,56 @@ def _build_legend_html(
 # ---------------------------------------------------------------------------
 
 def load_all(data_dir: Path) -> Iterable[dict]:
-    for path in sorted(data_dir.glob("*.json")):
+    """Yield each payload under ``data_dir/v<SCHEMA_VERSION>/*.json``,
+    aborting on schema mismatch.
+
+    A file is rejected (via ``SystemExit``) if any of the following hold:
+
+    * its top-level JSON value is not an object;
+    * the ``"version"`` field is missing or ``null`` (legacy / pre-versioning
+      data, retroactively called "version 0");
+    * the in-file version doesn't match :data:`SCHEMA_VERSION`. The
+      directory and the field are written together; any disagreement
+      means the file was moved by hand and should be triaged.
+
+    Files at the top level of ``data_dir``, or under any other ``v<N>/``
+    subdirectory, are ignored. Only files under
+    ``data/v<SCHEMA_VERSION>/`` participate; pre-versioning data and
+    scrapes from other schema revisions are out of scope for this build.
+
+    Aborting on the first bad file rather than skipping it is deliberate:
+    silently dropping a file produces a partial map with no obvious
+    indication that data is missing, which is the failure mode the
+    versioning was added to prevent.
+    """
+    version_dir = data_dir / f"v{SCHEMA_VERSION}"
+    if not version_dir.is_dir():
+        # No scrapes for this schema yet — yield nothing; main() will
+        # surface the friendlier "check data/v<N>/" error if the result
+        # is empty across all climb types.
+        return
+    for path in sorted(version_dir.glob("*.json")):
         with path.open() as fp:
-            yield json.load(fp)
+            payload = json.load(fp)
+        if not isinstance(payload, dict):
+            raise SystemExit(
+                f"{path} is not a JSON object at the top level. "
+                f"Re-scrape or remove the file before re-running."
+            )
+        stamped = payload.get("version")
+        if stamped is None:
+            raise SystemExit(
+                f"{path} has version 0 (missing); "
+                f"this build expects version {SCHEMA_VERSION}. "
+                f"Re-scrape or remove the file before re-running."
+            )
+        if stamped != SCHEMA_VERSION:
+            raise SystemExit(
+                f"{path} has version {stamped!r} in its envelope but "
+                f"lives under {version_dir}/. Directory and field "
+                f"disagree; re-scrape or move the file before re-running."
+            )
+        yield payload
 
 
 def main() -> None:
@@ -930,8 +995,15 @@ def main() -> None:
             rows_by_type[ct.label].extend(aggregate_by_area(payload, ct))
 
     if not any(rows_by_type.values()):
+        # Most common cause when this fires after the v<N>/ migration:
+        # the user has scrapes at the top level (data/*.json) instead of
+        # under data/v<SCHEMA_VERSION>/, so load_all yielded nothing.
+        # Mention the layout up front so the fix is obvious.
         raise SystemExit(
-            "No climbing areas with valid grades were found in any climb type."
+            "No climbing areas with valid grades were found in any climb "
+            f"type. Check that data/v{SCHEMA_VERSION}/ contains scraped "
+            f"JSON files — top-level files and other data/v<N>/ directories "
+            f"are ignored."
         )
 
     output = build_heatmap(
