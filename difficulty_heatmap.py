@@ -471,11 +471,34 @@ class _BlobsCanvasLayer(MacroElement):
             var BlobsLayer = L.Layer.extend({
                 onAdd: function (map) {
                     this._map = map;
+                    // Render the blobs into a dedicated pane that sits BELOW
+                    // Leaflet's default overlayPane (z-index 400). The
+                    // per-area click-target dots are CircleMarkers, and with
+                    // ``prefer_canvas=True`` they render onto Leaflet's
+                    // shared L.Canvas renderer — which lives in overlayPane.
+                    //
+                    // If we also appended into overlayPane, the two canvases
+                    // would stack by DOM insertion order. On initial load
+                    // the dots' canvas is created lazily by the first
+                    // CircleMarker insertion (after our blob canvas), so it
+                    // wins. But on a base-layer toggle the OLD blob canvas
+                    // is removed while the dots' canvas persists, and the
+                    // NEW blob canvas appends at the end of overlayPane —
+                    // landing on top of the dots and hiding them. Pinning
+                    // blobs to their own lower-z-index pane breaks that
+                    // ordering dependency for good.
+                    var paneName = 'difficultyBlobsPane';
+                    var pane = map.getPane(paneName);
+                    if (!pane) {
+                        pane = map.createPane(paneName);
+                        pane.style.zIndex = 350;
+                        pane.style.pointerEvents = 'none';
+                    }
                     var canvas = this._canvas = L.DomUtil.create(
                         'canvas', 'leaflet-zoom-hide'
                     );
                     canvas.style.pointerEvents = 'none';
-                    map.getPanes().overlayPane.appendChild(canvas);
+                    pane.appendChild(canvas);
                     map.on('moveend resize zoomend', this._reset, this);
                     this._reset();
                 },
