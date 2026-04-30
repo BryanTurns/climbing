@@ -32,6 +32,19 @@ interrupted = False
 DEFAULT_THREADS = 10
 DEFAULT_OUTPUT_FILE = "data.json"
 
+# Schema version stamped into every JSON file we write AND used to choose
+# the per-version output directory (``data/v<SCHEMA_VERSION>/``). Bump
+# whenever the envelope's shape changes (renamed/removed/added fields,
+# changed types, changed semantics) so downstream consumers can refuse
+# files they were not built to understand. This is a data-shape version,
+# independent of the scraper's own behaviour.
+#
+# The directory layout and the in-file version are kept in sync on
+# write; the heatmap validates both on read so a manually-moved file
+# (e.g. v1 contents copied into data/v2/) is caught instead of silently
+# accepted.
+SCHEMA_VERSION = 1
+
 # Per-request safety net for HTTP fetches.
 #
 # (CONNECT_TIMEOUT, READ_TIMEOUT) cap the gap between bytes the
@@ -223,10 +236,17 @@ def _handle_interrupt(signum, frame):
 
 
 def _save_routes(fname):
-    out_dir = Path("./data")
+    # Per-version output directory: data/v<SCHEMA_VERSION>/<fname>. Bumping
+    # SCHEMA_VERSION automatically routes new scrapes into a fresh
+    # subdirectory, so old data stays untouched and a future migration
+    # can read v<old> and write v<new> without overlap.
+    out_dir = Path("./data") / f"v{SCHEMA_VERSION}"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / fname
     output = {
+        # Stamp the schema version first so a `head -c` peek at the file
+        # surfaces it without having to load the whole document.
+        "version": SCHEMA_VERSION,
         "route_areas": all_route_areas,
         "routes": all_routes,
     }
