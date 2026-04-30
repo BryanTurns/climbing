@@ -6,18 +6,23 @@ For every JSON file in ``data/`` we, for each supported climb type
   2. translate each grade to a numeric value (YDS for ropes, V-scale for
      boulders; in both cases a full-grade jump is 4 points and the
      within-grade modifiers are 1 point apart),
-  3. average the numeric difficulty per route area,
+  3. aggregate the numeric difficulty per route area (mean OR median;
+     both are precomputed and the user toggles between them at view
+     time),
   4. render each area as a colour-coded blob on a Folium map.
-     The hue is picked from a cool-to-hot colormap by the area's mean
-     difficulty; the alpha alone fades with distance from the GPS point,
-     so an area's colour stays constant inside its blob.  Each blob's
-     radius scales with the number of routes in the area (area ∝ route
-     count), so dense crags read as visibly larger blobs than minor ones.
+     The hue is picked from a cool-to-hot colormap by the area's
+     aggregated difficulty; the alpha alone fades with distance from the
+     GPS point, so an area's colour stays constant inside its blob.
+     Each blob's radius scales with the number of routes in the area
+     (area ∝ route count), so dense crags read as visibly larger blobs
+     than minor ones.
 
-A layer-control radio in the corner switches between climb types, and the
-legend at the bottom of the map updates to match the active scale.  Only
-climb types that actually have data in the loaded JSON files appear in the
-toggle, so a sport-only crag won't show empty Trad/Boulder buttons.
+A layer-control radio in the corner switches between climb types, an
+aggregation-method radio next to it switches between mean and median, and
+the legend at the bottom of the map updates to match the active scale.
+Only climb types that actually have data in the loaded JSON files appear
+in the toggle, so a sport-only crag won't show empty Trad/Boulder
+buttons.
 
 Run::
 
@@ -305,8 +310,11 @@ ROPE_TICK_GRADES = [
 
 
 def _rope_legend_subtitle(discipline: str) -> str:
+    # The leading "{agg}" placeholder is filled in client-side by
+    # ``_build_legend_html`` so a single legend block can swap between
+    # "Mean" and "Median" without re-rendering the whole subtitle.
     return (
-        f"Mean {discipline} difficulty per area "
+        f"{{agg}} {discipline} difficulty per area "
         f"({ROPE_SCALE_MIN}–{ROPE_SCALE_MAX})"
     )
 
@@ -359,7 +367,7 @@ BOULDER = ClimbTypeConfig(
     scale_min_grade="V0",
     scale_max_grade="V12",
     tick_grades=["V0", "V2", "V4", "V6", "V8", "V10", "V12"],
-    legend_subtitle="Mean boulder difficulty per area (V0–V12)",
+    legend_subtitle="{agg} boulder difficulty per area (V0–V12)",
 )
 
 # Order matters: it drives the radio-button order in the layer control and
@@ -368,6 +376,56 @@ BOULDER = ClimbTypeConfig(
 # order — Sport, Trad, Top Rope — followed by Boulder which uses a
 # different grade scale.
 CLIMB_TYPES: list[ClimbTypeConfig] = [SPORT, TRAD, TOP_ROPE, BOULDER]
+
+
+# ---------------------------------------------------------------------------
+# Aggregation-method configuration
+# ---------------------------------------------------------------------------
+#
+# Each area's per-route scores can be summarised either as a mean or as a
+# median.  Both are precomputed in ``aggregate_by_area`` and packed into
+# every blob's payload so the in-browser toggle is purely a visibility
+# swap — no Python re-aggregation, no re-emit of the HTML file.
+#
+# Adding a new method (e.g. a trimmed mean) is a matter of appending an
+# entry here and computing its value in ``aggregate_by_area`` so the
+# downstream pipeline picks it up automatically.
+
+@dataclass
+class AggregationMethod:
+    key: str       # short identifier used in JS state ("mean", "median")
+    label: str     # display label on the toggle ("Mean", "Median")
+    field: str     # row dict key on aggregated rows ("mean_difficulty", ...)
+
+
+AGGREGATION_MEAN = AggregationMethod(
+    key="mean", label="Mean", field="mean_difficulty",
+)
+AGGREGATION_MEDIAN = AggregationMethod(
+    key="median", label="Median", field="median_difficulty",
+)
+
+# Order matters: it drives the radio-button order in the toggle and
+# determines the default-active method (the first entry).
+AGGREGATION_METHODS: list[AggregationMethod] = [
+    AGGREGATION_MEAN, AGGREGATION_MEDIAN,
+]
+DEFAULT_AGGREGATION = AGGREGATION_METHODS[0]
+
+
+def _median(values: list[float]) -> float:
+    """Return the median of ``values`` (midpoint of the two middle values
+    on even-length inputs, matching ``statistics.median``).
+
+    Caller guarantees the list is non-empty -- ``aggregate_by_area`` only
+    builds rows for areas that contributed at least one score.
+    """
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    mid = n // 2
+    if n % 2 == 0:
+        return (sorted_vals[mid - 1] + sorted_vals[mid]) / 2.0
+    return float(sorted_vals[mid])
 
 
 def _scale_bounds(climb_type: ClimbTypeConfig) -> tuple[float, float]:
@@ -403,7 +461,11 @@ def _quantize_to_bucket(score: float, scale_min: float, scale_max: float) -> int
 def aggregate_by_area(
     payload: dict, climb_type: ClimbTypeConfig
 ) -> list[dict]:
-    """Average a climb type's route difficulty per area, attaching GPS coords.
+    """Aggregate a climb type's route difficulty per area, attaching GPS coords.
+
+    Both the mean and median per area are emitted on every row so the
+    in-browser aggregation toggle can swap between them without
+    re-running this function.
 
     Aggregation keys on ``route_area_id`` -- the numeric ID embedded in
     the Mountain Project URL -- rather than the area name. Names are not
@@ -445,6 +507,7 @@ def aggregate_by_area(
                 "lat": area["gps"]["lat"],
                 "lon": area["gps"]["lon"],
                 "mean_difficulty": sum(scores) / len(scores),
+                "median_difficulty": _median(scores),
                 "max_difficulty": max(scores),
                 "min_difficulty": min(scores),
                 "n_routes": len(scores),
@@ -504,10 +567,17 @@ def _radius_for_n_routes(n_routes: int) -> float:
 class _BlobsCanvasLayer(MacroElement):
     """A single canvas overlay that paints N radial-gradient blobs at once.
 
-    Each entry in ``blobs`` is ``[lat, lon, r, g, b, radius]`` — both the
-    colour and the radius vary per blob, so areas with different mean
-    difficulties get different hues and areas with different route counts
-    get different sizes.
+    Each entry in ``blobs`` carries the per-blob geometry plus one ``[r, g,
+    b]`` triple per supported aggregation method, in the same order as
+    :data:`AGGREGATION_METHODS`::
+
+        [lat, lon, radius, mean_r, mean_g, mean_b, median_r, median_g, median_b]
+
+    Which triple is drawn is decided at paint time by the global
+    ``window.__heatmapAggState`` set up by :class:`_AggregationState`. The
+    layer subscribes on add and re-draws when the user flips the toggle,
+    so swapping between Mean and Median is a redraw rather than a
+    layer-replacement.
     """
 
     _name = "BlobsCanvasLayer"
@@ -517,7 +587,17 @@ class _BlobsCanvasLayer(MacroElement):
         {% macro script(this, kwargs) %}
         (function () {
             var blobs   = {{ this.blobs | tojson }};
+            var aggKeys = {{ this.agg_keys | tojson }};
             var map     = {{ this._parent.get_name() }};
+
+            // Index of the colour triple inside each blob entry for a
+            // given aggregation key. Mean lives at offset 3..5, median
+            // at 6..8, etc. -- one slot of three per method, in the
+            // same order Python emitted them.
+            var rgbOffsetByAgg = {};
+            for (var i = 0; i < aggKeys.length; i++) {
+                rgbOffsetByAgg[aggKeys[i]] = 3 + i * 3;
+            }
 
             var BlobsLayer = L.Layer.extend({
                 onAdd: function (map) {
@@ -551,11 +631,24 @@ class _BlobsCanvasLayer(MacroElement):
                     canvas.style.pointerEvents = 'none';
                     pane.appendChild(canvas);
                     map.on('moveend resize zoomend', this._reset, this);
+                    // Re-paint when the aggregation toggle flips. The
+                    // unsubscribe handle is stashed so onRemove can stop
+                    // listening when this layer is swapped out by the
+                    // climb-type radio.
+                    var self = this;
+                    this._unsubscribeAgg =
+                        window.__heatmapAggState.subscribe(function () {
+                            self._reset();
+                        });
                     this._reset();
                 },
                 onRemove: function (map) {
                     L.DomUtil.remove(this._canvas);
                     map.off('moveend resize zoomend', this._reset, this);
+                    if (this._unsubscribeAgg) {
+                        this._unsubscribeAgg();
+                        this._unsubscribeAgg = null;
+                    }
                 },
                 _reset: function () {
                     var map   = this._map;
@@ -581,6 +674,14 @@ class _BlobsCanvasLayer(MacroElement):
                         0, 0, this._canvas.width, this._canvas.height
                     );
                     var map = this._map;
+                    // Resolve the active colour triple offset once per
+                    // redraw; falling back to mean if the state ever
+                    // names a method we didn't render for.
+                    var activeAgg = window.__heatmapAggState.get();
+                    var rgbOffset = rgbOffsetByAgg[activeAgg];
+                    if (rgbOffset === undefined) {
+                        rgbOffset = rgbOffsetByAgg[aggKeys[0]];
+                    }
                     // Pad the visible bounds so blobs whose centre is just
                     // off-screen still paint their visible halo.  Padding
                     // is generous because the largest blobs can extend a
@@ -589,13 +690,14 @@ class _BlobsCanvasLayer(MacroElement):
                     for (var i = 0; i < blobs.length; i++) {
                         var b = blobs[i];
                         var lat = b[0], lon = b[1];
-                        var radius = b[5];
+                        var radius = b[2];
                         if (lat < bounds.getSouth() || lat > bounds.getNorth()
                          || lon < bounds.getWest()  || lon > bounds.getEast()) {
                             continue;
                         }
                         var p = map.latLngToContainerPoint([lat, lon]);
-                        var rgb = b[2] + ',' + b[3] + ',' + b[4];
+                        var rgb = b[rgbOffset] + ',' + b[rgbOffset + 1] + ','
+                                + b[rgbOffset + 2];
                         var grad = ctx.createRadialGradient(
                             p.x, p.y, 0, p.x, p.y, radius
                         );
@@ -621,9 +723,140 @@ class _BlobsCanvasLayer(MacroElement):
         """
     )
 
-    def __init__(self, blobs: list[list]) -> None:
+    def __init__(self, blobs: list[list], agg_keys: list[str]) -> None:
         super().__init__()
         self.blobs = blobs
+        self.agg_keys = agg_keys
+
+
+# ---------------------------------------------------------------------------
+# Aggregation toggle: shared state + UI control.
+# ---------------------------------------------------------------------------
+#
+# The state object lives on ``window.__heatmapAggState`` so every blob
+# canvas (one per climb-type FeatureGroup) and the legend swapper can
+# subscribe without having to know about each other.  ``_AggregationState``
+# emits the state object once into the page; ``_AggregationToggle`` adds
+# the small radio control that flips it.
+
+class _AggregationState(MacroElement):
+    """Inject a tiny pub/sub state holder for the active aggregation method.
+
+    The holder exposes:
+
+    * ``get()``   - returns the current aggregation key (e.g. ``"mean"``);
+    * ``set(k)``  - swaps the key and notifies subscribers (no-op if the
+                    key is unchanged, so toggling between layers doesn't
+                    re-fire callbacks for free);
+    * ``subscribe(fn)`` - returns an unsubscribe function so canvas layers
+                          can clean up when removed by the climb-type
+                          radio.
+
+    Emitted exactly once at the map level (NOT per-FeatureGroup) so the
+    state survives base-layer toggles.
+    """
+
+    _name = "AggregationState"
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function () {
+            if (window.__heatmapAggState) { return; }
+            var current = {{ this.default_key | tojson }};
+            var subs = [];
+            window.__heatmapAggState = {
+                get: function () { return current; },
+                set: function (next) {
+                    if (next === current) { return; }
+                    current = next;
+                    for (var i = 0; i < subs.length; i++) {
+                        try { subs[i](current); } catch (e) { /* ignore */ }
+                    }
+                },
+                subscribe: function (fn) {
+                    subs.push(fn);
+                    return function () {
+                        var idx = subs.indexOf(fn);
+                        if (idx !== -1) { subs.splice(idx, 1); }
+                    };
+                }
+            };
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(self, default_key: str) -> None:
+        super().__init__()
+        self.default_key = default_key
+
+
+class _AggregationToggle(MacroElement):
+    """Render a small radio control that flips ``window.__heatmapAggState``.
+
+    Positioned to sit under the climb-type LayerControl (top-right). Uses
+    the same off-white panel styling as folium's built-in controls so it
+    reads as part of the same family without us having to import their
+    CSS.
+    """
+
+    _name = "AggregationToggle"
+
+    _template = Template(
+        """
+        {% macro html(this, kwargs) %}
+        <div class="aggregation-toggle" style="
+            position: fixed;
+            top: 170px;
+            right: 10px;
+            background: rgba(255,255,255,0.95);
+            padding: 8px 12px;
+            border: 2px solid rgba(0,0,0,0.2);
+            border-radius: 4px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+            z-index: 1000;
+            font-family: sans-serif;
+            font-size: 13px;
+            color: #222;
+        ">
+            <div style="font-weight:bold;margin-bottom:4px;">Aggregation</div>
+            {% for method in this.methods %}
+            <label style="display:block;cursor:pointer;line-height:1.6;">
+                <input type="radio"
+                       name="heatmap-agg"
+                       value="{{ method.key }}"
+                       {% if method.key == this.default_key %}checked{% endif %}
+                       style="margin-right:6px;vertical-align:middle;">
+                {{ method.label }}
+            </label>
+            {% endfor %}
+        </div>
+        {% endmacro %}
+
+        {% macro script(this, kwargs) %}
+        (function () {
+            var inputs = document.querySelectorAll(
+                '.aggregation-toggle input[name="heatmap-agg"]'
+            );
+            inputs.forEach(function (el) {
+                el.addEventListener('change', function () {
+                    if (el.checked) {
+                        window.__heatmapAggState.set(el.value);
+                    }
+                });
+            });
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(
+        self, methods: list[AggregationMethod], default_key: str,
+    ) -> None:
+        super().__init__()
+        self.methods = methods
+        self.default_key = default_key
 
 
 def _populate_climb_type_layer(
@@ -666,16 +899,26 @@ def _populate_climb_type_layer(
     # to the FeatureGroup (rather than directly to the map) means it gets
     # added/removed automatically when the climb-type radio toggles which
     # FeatureGroup is the active base layer.
+    #
+    # Each blob carries one ``(r, g, b)`` triple per supported aggregation
+    # method (mean, median) so the toggle only has to redraw — it doesn't
+    # have to recompute. The order MUST match ``AGGREGATION_METHODS`` so
+    # the canvas layer's offset lookup lines up.
     blobs: list[list[float]] = []
     for row in rows:
-        bucket = _quantize_to_bucket(
-            row["mean_difficulty"], scale_min, scale_max,
-        )
-        r, g, b = _hex_to_rgb(colormap(bucket))
         radius = _radius_for_n_routes(row["n_routes"])
-        blobs.append([row["lat"], row["lon"], r, g, b, radius])
+        entry: list[float] = [row["lat"], row["lon"], radius]
+        for method in AGGREGATION_METHODS:
+            bucket = _quantize_to_bucket(
+                row[method.field], scale_min, scale_max,
+            )
+            r, g, b = _hex_to_rgb(colormap(bucket))
+            entry.extend((r, g, b))
+        blobs.append(entry)
 
-    _BlobsCanvasLayer(blobs).add_to(feature_group)
+    _BlobsCanvasLayer(
+        blobs, agg_keys=[m.key for m in AGGREGATION_METHODS],
+    ).add_to(feature_group)
 
     # A small black dot at each area's GPS point makes the source obvious
     # and gives a click target for the popup.  Pack every area into a
@@ -685,9 +928,14 @@ def _populate_climb_type_layer(
     # for the browser to parse.  GeoJson packs the whole set into one
     # FeatureCollection plus one ``pointToLayer`` callback.  Popups must
     # show climber-facing grades, never the internal numeric score.
+    #
+    # Both the mean and median grades are listed in the popup so the user
+    # can compare them at a glance regardless of which one the heatmap
+    # toggle currently colours by.
     features = []
     for row in rows:
         mean_grade = climb_type.numeric_to_grade(row["mean_difficulty"])
+        median_grade = climb_type.numeric_to_grade(row["median_difficulty"])
         min_grade = climb_type.numeric_to_grade(row["min_difficulty"])
         max_grade = climb_type.numeric_to_grade(row["max_difficulty"])
         grade_range = (
@@ -705,6 +953,7 @@ def _populate_climb_type_layer(
                     "name": row["name"],
                     "n_routes": row["n_routes"],
                     "mean_grade": mean_grade,
+                    "median_grade": median_grade,
                     "range": grade_range,
                 },
             }
@@ -721,8 +970,11 @@ def _populate_climb_type_layer(
             fill_opacity=0.85,
         ),
         popup=folium.GeoJsonPopup(
-            fields=["name", "n_routes", "mean_grade", "range"],
-            aliases=["Area", f"{climb_type.label} routes", "Mean grade", "Range"],
+            fields=["name", "n_routes", "mean_grade", "median_grade", "range"],
+            aliases=[
+                "Area", f"{climb_type.label} routes",
+                "Mean grade", "Median grade", "Range",
+            ],
             max_width=320,
             localize=False,
         ),
@@ -792,6 +1044,13 @@ def build_heatmap(
         control=False,
     ).add_to(fmap)
 
+    # Inject the aggregation state holder BEFORE any FeatureGroup is
+    # populated. The blob canvas layers subscribe to it on add, and on
+    # initial page load Leaflet adds the default base layer (which adds
+    # its blob canvas) before the layer control is wired up — so the
+    # state object has to exist by then.
+    fmap.add_child(_AggregationState(DEFAULT_AGGREGATION.key))
+
     # One FeatureGroup per active climb type, registered as a *base layer*
     # (overlay=False) so folium's LayerControl renders them as a
     # mutually-exclusive radio group rather than independent checkboxes.
@@ -817,11 +1076,24 @@ def build_heatmap(
         autoZIndex=True,
     ).add_to(fmap)
 
+    # Aggregation-method radio sits below the climb-type LayerControl;
+    # flipping it pushes the new key into ``window.__heatmapAggState``,
+    # which the blob canvas + legend subscribers pick up.
+    fmap.add_child(
+        _AggregationToggle(AGGREGATION_METHODS, DEFAULT_AGGREGATION.key),
+    )
+
     # Render every climb type's legend in the same fixed position; only
     # the default starts visible.  The ``LegendSwapper`` macro below
-    # listens for ``baselayerchange`` and toggles ``display`` accordingly.
+    # listens for ``baselayerchange`` AND aggregation state changes and
+    # toggles both block visibility and per-block subtitle visibility.
     legend_blocks = "".join(
-        _build_legend_html(ct, hidden=(ct is not default_type))
+        _build_legend_html(
+            ct,
+            hidden=(ct is not default_type),
+            aggregation_methods=AGGREGATION_METHODS,
+            default_aggregation=DEFAULT_AGGREGATION,
+        )
         for ct in active_types
     )
     fmap.get_root().html.add_child(folium.Element(legend_blocks))
@@ -833,13 +1105,16 @@ def build_heatmap(
 
 
 class _LegendSwapper(MacroElement):
-    """Swap which climb-type legend is visible when the base layer changes.
+    """Swap which legend block + subtitle is visible based on the active
+    climb type and aggregation method.
 
     Folium's LayerControl emits Leaflet's ``baselayerchange`` event with the
     layer's display name on ``e.name`` — that matches the ``label`` field on
     each ``ClimbTypeConfig``, which is also written into the legend block's
-    ``data-climb-type`` attribute.  We just toggle ``display`` on whichever
-    legend block matches.
+    ``data-climb-type`` attribute. The aggregation toggle pushes its key
+    through ``window.__heatmapAggState``; each block carries one subtitle
+    span per method tagged with ``data-agg``, and we only show the one
+    matching the current state.
     """
 
     _name = "LegendSwapper"
@@ -849,21 +1124,45 @@ class _LegendSwapper(MacroElement):
         {% macro script(this, kwargs) %}
         (function () {
             var map = {{ this._parent.get_name() }};
-            function showLegendFor(name) {
+            var activeClimbType = {{ this.default_label | tojson }};
+
+            function showSubtitleFor(block, aggKey) {
+                var subtitles = block.querySelectorAll(
+                    '.legend-subtitle[data-agg]'
+                );
+                subtitles.forEach(function (sub) {
+                    sub.style.display =
+                        (sub.dataset.agg === aggKey) ? 'block' : 'none';
+                });
+            }
+            function refresh() {
+                var aggKey = window.__heatmapAggState.get();
                 var legends = document.querySelectorAll(
                     '.difficulty-legend[data-climb-type]'
                 );
                 legends.forEach(function (el) {
-                    el.style.display =
-                        (el.dataset.climbType === name) ? 'block' : 'none';
+                    var visible = (el.dataset.climbType === activeClimbType);
+                    el.style.display = visible ? 'block' : 'none';
+                    // Keep all blocks' subtitle state in sync with the
+                    // active aggregation, even hidden ones — that way
+                    // when the user later flips the climb-type radio the
+                    // newly-revealed block already shows the right
+                    // subtitle without an extra paint.
+                    showSubtitleFor(el, aggKey);
                 });
             }
+
             map.on('baselayerchange', function (e) {
-                showLegendFor(e.name);
+                activeClimbType = e.name;
+                refresh();
             });
-            // Run once on load so the default layer's legend is visible
-            // even if the user never toggles.
-            showLegendFor({{ this.default_label | tojson }});
+            window.__heatmapAggState.subscribe(function () {
+                refresh();
+            });
+            // Run once on load so the default layer's legend (and the
+            // default aggregation's subtitle) is visible even if the
+            // user never toggles either control.
+            refresh();
         })();
         {% endmacro %}
         """
@@ -875,7 +1174,11 @@ class _LegendSwapper(MacroElement):
 
 
 def _build_legend_html(
-    climb_type: ClimbTypeConfig, *, hidden: bool,
+    climb_type: ClimbTypeConfig,
+    *,
+    hidden: bool,
+    aggregation_methods: list[AggregationMethod],
+    default_aggregation: AggregationMethod,
 ) -> str:
     """Return an HTML overlay that mirrors the colormap with grade tick labels.
 
@@ -886,9 +1189,11 @@ def _build_legend_html(
     (YDS or V-scale, depending on the climb type) at the same proportional
     positions they occupy on the (focused) numeric scale.
 
-    All climb types render legends at the same fixed position; the
-    :class:`_LegendSwapper` macro toggles ``display`` so only the active
-    type's legend is visible.
+    The block carries one ``<span class="legend-subtitle">`` per
+    aggregation method (formed from ``climb_type.legend_subtitle`` with
+    ``{agg}`` filled in). :class:`_LegendSwapper` toggles which block AND
+    which subtitle is visible based on the active climb type and
+    aggregation key.
     """
     scale_min, scale_max = _scale_bounds(climb_type)
     span = scale_max - scale_min
@@ -922,6 +1227,19 @@ def _build_legend_html(
         for _, pct in ticks
     )
 
+    # One subtitle per aggregation method, only the default-active one
+    # rendered with ``display:block``. The legend swapper flips these on
+    # state changes; the rest stay in the DOM ready to swap.
+    subtitle_spans = "".join(
+        (
+            f'<span class="legend-subtitle" data-agg="{method.key}" '
+            f'style="display:{"block" if method is default_aggregation else "none"};">'
+            f'{climb_type.legend_subtitle.format(agg=method.label)}'
+            f'</span>'
+        )
+        for method in aggregation_methods
+    )
+
     display = "none" if hidden else "block"
 
     return f"""
@@ -940,7 +1258,7 @@ def _build_legend_html(
         font-family: sans-serif;
     ">
         <div style="text-align:center;font-size:12px;color:#222;margin-bottom:6px;">
-            {climb_type.legend_subtitle}
+            {subtitle_spans}
         </div>
         <div style="position:relative;width:440px;">
             <div style="
