@@ -8,7 +8,9 @@ For every JSON file in ``data/`` we:
   4. render each area as its own single-hue heat source on a Folium map.
      The hue is picked from a cool-to-hot colormap by the area's mean
      difficulty; the alpha alone fades with distance from the GPS point,
-     so an area's colour stays constant inside its blob.
+     so an area's colour stays constant inside its blob.  Each blob's
+     radius scales with the number of routes in the area (area ∝ route
+     count), so dense crags read as visibly larger blobs than minor ones.
 
 Run::
 
@@ -20,6 +22,7 @@ The output is written to ``route_difficulty_heatmap.html``.
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Iterable
@@ -230,6 +233,24 @@ def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
+# Per-blob radius is scaled from the area's route count. We use sqrt scaling
+# so the *area* of the blob (which is what the eye perceives as "size") is
+# proportional to the route count rather than its radius — otherwise a
+# 100-route crag would render with 100x the visual mass of a 1-route one and
+# swamp the map. Bounds keep tiny areas legible and stop a single mega-area
+# from eating the whole viewport at low zoom levels.
+MIN_BLOB_RADIUS = 30      # pixels; floor so 1-route areas are still visible
+MAX_BLOB_RADIUS = 140     # pixels; cap so a 500-route crag doesn't dominate
+BLOB_RADIUS_SCALE = 22    # multiplier on sqrt(n_routes)
+
+
+def _radius_for_n_routes(n_routes: int) -> float:
+    """Pixel radius for an area's blob, scaled so blob area ∝ route count."""
+    n = max(1, int(n_routes))
+    raw = BLOB_RADIUS_SCALE * math.sqrt(n)
+    return max(MIN_BLOB_RADIUS, min(MAX_BLOB_RADIUS, raw))
+
+
 # ---------------------------------------------------------------------------
 # Custom Leaflet layer: paint every area's blob into a single shared canvas.
 # ---------------------------------------------------------------------------
@@ -245,7 +266,13 @@ def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
 # edge, just like before.  Off-screen blobs are skipped (viewport culling) and
 # the canvas is sized for high-DPI displays so gradients stay crisp.
 class _BlobsCanvasLayer(MacroElement):
-    """A single canvas overlay that paints N radial-gradient blobs at once."""
+    """A single canvas overlay that paints N radial-gradient blobs at once.
+
+    Each entry in ``blobs`` is ``[lat, lon, r, g, b, radius]`` — both the
+    colour and the radius vary per blob, so areas with different mean
+    difficulties get different hues and areas with different route counts
+    get different sizes.
+    """
 
     _name = "BlobsCanvasLayer"
 
@@ -254,7 +281,6 @@ class _BlobsCanvasLayer(MacroElement):
         {% macro script(this, kwargs) %}
         (function () {
             var blobs   = {{ this.blobs | tojson }};
-            var radius  = {{ this.radius }};
             var map     = {{ this._parent.get_name() }};
 
             var BlobsLayer = L.Layer.extend({
@@ -296,12 +322,15 @@ class _BlobsCanvasLayer(MacroElement):
                         0, 0, this._canvas.width, this._canvas.height
                     );
                     var map = this._map;
-                    // Pad the visible bounds slightly so blobs whose centre
-                    // is just off-screen still paint their visible halo.
-                    var bounds = map.getBounds().pad(0.25);
+                    // Pad the visible bounds so blobs whose centre is just
+                    // off-screen still paint their visible halo.  Padding
+                    // is generous because the largest blobs can extend a
+                    // long way past their centre at high zoom levels.
+                    var bounds = map.getBounds().pad(0.5);
                     for (var i = 0; i < blobs.length; i++) {
                         var b = blobs[i];
                         var lat = b[0], lon = b[1];
+                        var radius = b[5];
                         if (lat < bounds.getSouth() || lat > bounds.getNorth()
                          || lon < bounds.getWest()  || lon > bounds.getEast()) {
                             continue;
@@ -333,10 +362,9 @@ class _BlobsCanvasLayer(MacroElement):
         """
     )
 
-    def __init__(self, blobs: list[list], radius: int = 80) -> None:
+    def __init__(self, blobs: list[list]) -> None:
         super().__init__()
         self.blobs = blobs
-        self.radius = radius
 
 
 def build_heatmap(rows: list[dict], output_path: str | Path) -> Path:
@@ -400,42 +428,20 @@ def build_heatmap(rows: list[dict], output_path: str | Path) -> Path:
         vmax=SCALE_MAX_NUMERIC,      # 5.14d
     )
 
-    # Group areas by their colour bucket and emit ONE HeatMap layer per
-    # bucket (capped at ~32) instead of one per area (potentially
-    # thousands).  Each bucket's layer uses a one-colour gradient where
-    # only the alpha changes with intensity: centre = full-alpha-colour,
-    # edge = same colour but transparent.  Because every stop in the
-    # gradient shares the same RGB, every blob in the layer keeps the
-    # bucket's colour and only the transparency fades with distance from
-    # each GPS point.
-    #
-    # Side-effect of folding multiple points into one layer: clusters of
-    # similar-grade crags accumulate alpha and read as a brighter blob in
-    # that hue, which is a useful density cue.  leaflet-heat caps the
-    # accumulated intensity at ``max`` (default 1.0), so the blob stays
-    # at the gradient's maximum opacity rather than washing out.
-    buckets: dict[int, list[list[float]]] = {}
+    # Build one blob per area: colour comes from the difficulty colormap
+    # (quantised into discrete buckets so similar-grade crags share a hue),
+    # radius comes from the area's route count (sqrt-scaled so blob *area*
+    # is what's proportional to the count -- see _radius_for_n_routes).
+    # All blobs paint into a single shared canvas via _BlobsCanvasLayer,
+    # which keeps rendering fast at hundreds of areas.
+    blobs: list[list[float]] = []
     for row in rows:
         bucket = _quantize_to_bucket(row["mean_difficulty"])
-        buckets.setdefault(bucket, []).append([row["lat"], row["lon"], 1.0])
-
-    for bucket, points in buckets.items():
         r, g, b = _hex_to_rgb(colormap(bucket))
-        single_hue_gradient = {
-            0.05: f"rgba({r},{g},{b},0)",     # far edge: transparent
-            0.40: f"rgba({r},{g},{b},0.35)",
-            0.70: f"rgba({r},{g},{b},0.65)",
-            1.00: f"rgba({r},{g},{b},0.90)",  # centre: opaque
-        }
+        radius = _radius_for_n_routes(row["n_routes"])
+        blobs.append([row["lat"], row["lon"], r, g, b, radius])
 
-        HeatMap(
-            points,
-            radius=55,   # how far the heat reaches, in pixels
-            blur=40,     # softness of the alpha falloff
-            min_opacity=0,
-            max_zoom=1,  # treat the intensity as already normalised
-            gradient=single_hue_gradient,
-        ).add_to(fmap)
+    _BlobsCanvasLayer(blobs).add_to(fmap)
 
 
     # A small black dot at each area's GPS point makes the source obvious
