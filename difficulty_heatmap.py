@@ -1,4 +1,4 @@
-"""Render a Folium heatmap of route difficulty per area, toggleable by climb type.
+"""Render a Folium heatmap of route difficulty AND popularity per area.
 
 For every JSON file in ``data/`` we, for each supported climb type
 (``Sport``, ``Trad``, ``Top Rope``, ``Boulder``):
@@ -6,23 +6,39 @@ For every JSON file in ``data/`` we, for each supported climb type
   2. translate each grade to a numeric value (YDS for ropes, V-scale for
      boulders; in both cases a full-grade jump is 4 points and the
      within-grade modifiers are 1 point apart),
-  3. aggregate the numeric difficulty per route area (mean OR median;
-     both are precomputed and the user toggles between them at view
-     time),
+  3. aggregate per route area, on two orthogonal axes:
+       * **metric** -- difficulty (numeric grade, aggregated as mean or
+         median) or popularity (the area's total route page-views per
+         month for routes of the active climb type, log-transformed so
+         the long tail spreads across the colour gradient),
+       * **aggregation method** -- mean or median.  Only applies to
+         difficulty; popularity is a single sum per area, so the
+         Mean/Median toggle has no visible effect when popularity is
+         the active metric.
+     All values are precomputed per area and the user toggles between
+     them at view time,
   4. render each area as a colour-coded blob on a Folium map.
-     The hue is picked from a cool-to-hot colormap by the area's
-     aggregated difficulty; the alpha alone fades with distance from the
-     GPS point, so an area's colour stays constant inside its blob.
-     Each blob's radius scales with the number of routes in the area
-     (area ∝ route count), so dense crags read as visibly larger blobs
-     than minor ones.
+     The hue is picked from the active metric's colormap (cool-to-hot
+     diverging for difficulty; sequential viridis for popularity, so
+     a glance at the legend is enough to know which metric is active);
+     the alpha alone fades with distance from the GPS point, so an
+     area's colour stays constant inside its blob.  Each blob's radius
+     scales with the number of routes in the area (area ∝ route count),
+     so dense crags read as visibly larger blobs than minor ones
+     regardless of metric.
 
-A layer-control radio in the corner switches between climb types, an
-aggregation-method radio next to it switches between mean and median, and
-the legend at the bottom of the map updates to match the active scale.
-Only climb types that actually have data in the loaded JSON files appear
-in the toggle, so a sport-only crag won't show empty Trad/Boulder
-buttons.
+Three radio controls stack in the top-right corner:
+  * **Climb type** (Sport / Trad / Top Rope / Boulder) -- a layer-control
+    radio that swaps which FeatureGroup is the active base layer.  Only
+    climb types that actually have data in the loaded JSON files appear,
+    so a sport-only crag won't show empty Trad/Boulder buttons.
+  * **Aggregation** (Mean / Median) -- swaps which precomputed score
+    drives the colour bucket per area.
+  * **Metric** (Difficulty / Popularity) -- swaps which colormap and
+    legend are active.
+
+The legend at the bottom of the map updates to match the active
+``(climb_type, metric)`` pair and active aggregation method.
 
 Run::
 
@@ -395,15 +411,10 @@ CLIMB_TYPES: list[ClimbTypeConfig] = [SPORT, TRAD, TOP_ROPE, BOULDER]
 class AggregationMethod:
     key: str       # short identifier used in JS state ("mean", "median")
     label: str     # display label on the toggle ("Mean", "Median")
-    field: str     # row dict key on aggregated rows ("mean_difficulty", ...)
 
 
-AGGREGATION_MEAN = AggregationMethod(
-    key="mean", label="Mean", field="mean_difficulty",
-)
-AGGREGATION_MEDIAN = AggregationMethod(
-    key="median", label="Median", field="median_difficulty",
-)
+AGGREGATION_MEAN = AggregationMethod(key="mean", label="Mean")
+AGGREGATION_MEDIAN = AggregationMethod(key="median", label="Median")
 
 # Order matters: it drives the radio-button order in the toggle and
 # determines the default-active method (the first entry).
@@ -411,6 +422,20 @@ AGGREGATION_METHODS: list[AggregationMethod] = [
     AGGREGATION_MEAN, AGGREGATION_MEDIAN,
 ]
 DEFAULT_AGGREGATION = AGGREGATION_METHODS[0]
+
+
+# The row dict written by ``aggregate_by_area`` carries either one
+# column per ``(aggregation_method, metric)`` pair (e.g.
+# ``"mean_difficulty"``, ``"median_difficulty"``) for metrics that
+# differ between mean and median, or one column total (e.g.
+# ``"popularity"``) for metrics that don't vary by aggregation method.
+# ``MetricConfig.aggregation_aware`` picks between the two layouts; the
+# Mean/Median toggle has no visible effect when a non-aggregation-aware
+# metric is active.
+def _row_field(method: AggregationMethod, metric: "MetricConfig") -> str:
+    if not metric.aggregation_aware:
+        return metric.row_suffix
+    return f"{method.key}_{metric.row_suffix}"
 
 
 def _median(values: list[float]) -> float:
@@ -455,17 +480,241 @@ def _quantize_to_bucket(score: float, scale_min: float, scale_max: float) -> int
 
 
 # ---------------------------------------------------------------------------
+# Metric configuration
+# ---------------------------------------------------------------------------
+#
+# A "metric" is a quantity we render as a colour-coded blob -- difficulty
+# (how hard the routes are) and popularity (how many people are looking
+# at them).  The two are orthogonal to climb type and aggregation method:
+# any combination of (climb_type, metric, aggregation_method) is a valid
+# view, and the in-browser toggles flip between them without re-running
+# the Python pipeline.
+#
+# Each metric bundles:
+#   * a palette (deliberately distinct between metrics so a glance at the
+#     legend is enough to know which one you're looking at);
+#   * the per-route value extractor used during aggregation;
+#   * a transform that turns aggregated linear values into the internal
+#     numeric score the colormap reads (identity for difficulty, log10 for
+#     popularity);
+#   * per-climb-type scale bounds, legend ticks, and subtitle template.
+#
+# Adding a metric is a matter of appending another entry to ``METRICS``
+# and providing the four callables — the blob/legend/aggregation pipelines
+# pick it up automatically.
+
+# Cool-to-hot diverging palette: cool = easy, hot = hard.  Used for the
+# difficulty metric only.
+DIFFICULTY_COLOURS = ["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"]
+
+# Sequential viridis palette: visually distinct from the diverging
+# cool-to-hot above so swapping metrics is unmistakable at a glance, and
+# colour-blind safe (perceptually uniform from dark purple through teal
+# to yellow).  Used for the popularity metric only.
+POPULARITY_COLOURS = ["#440154", "#3b528b", "#21918c", "#5ec962", "#fde725"]
+
+
+# Popularity is heavy long-tail: most areas get a few dozen views/month
+# total, a handful pull hundreds or thousands.  Linear bucketing in
+# views-space would collapse 95% of areas into the bottom colour bucket,
+# so we transform to log10 views/month before the colormap evaluation.
+# ``POP_LOG_SCALE_FACTOR`` multiplies the log value so the integer
+# rounding in ``_quantize_to_bucket`` still gives smooth gradients
+# (factor 20 ⇒ ~20 buckets per order of magnitude).
+POP_LOG_SCALE_FACTOR = 20
+
+# Display range for popularity: 10 → 1000 total views/month per area
+# covers roughly the median through p99 across all climb types in a
+# typical scrape (Boulder Canyon median sport area ≈ 43, p99 ≈ 572,
+# max ≈ 864; trad/boulder distributions sit close to that).  Areas
+# above 1000/mo saturate to the hottest colour, which is the right
+# visual story for a "very popular crag" — the legend stays readable
+# instead of being stretched to fit rare megaclassics.
+POP_SCALE_MIN_VIEWS = 10
+POP_SCALE_MAX_VIEWS = 1000
+
+# Tick positions for the popularity legend: log-spaced so each step is
+# half an order of magnitude.
+POP_TICK_VIEWS = [10, 30, 100, 300, 1000]
+
+
+def _to_pop_score(views_per_month: float) -> float:
+    """Log-transform a views/month rate into the internal numeric score.
+
+    The bucketing in :func:`_quantize_to_bucket` rounds to integer slots,
+    so we scale the log value up by :data:`POP_LOG_SCALE_FACTOR` to
+    preserve enough resolution for smooth colour transitions. Inputs at
+    or below 0 (no recorded views) clamp to ``log10(0.5)`` so we never
+    hand a ``-inf`` to the colormap — areas with zero views render at
+    the coolest end of the gradient, same as 1 view/month would.
+    """
+    return math.log10(max(views_per_month, 0.5)) * POP_LOG_SCALE_FACTOR
+
+
+def _format_views(views: int) -> str:
+    """Render a views-per-month integer for the popularity legend."""
+    if views >= 1000:
+        return f"{views // 1000}k"
+    return str(views)
+
+
+@dataclass
+class MetricConfig:
+    key: str                                       # state key in JS ("difficulty", "popularity")
+    label: str                                     # display label on the toggle
+    palette: list[str]                             # gradient colours (cool → hot)
+    row_suffix: str                                # column suffix in row dicts
+    # Pull this metric's per-route value off a route record.  Returns
+    # ``None`` for routes that don't contribute (e.g. an unparseable
+    # grade for the difficulty metric).
+    route_value: Callable[[dict, ClimbTypeConfig], float | None]
+    # Transform an aggregated linear value into the internal numeric
+    # score the colormap reads.  Identity for difficulty (already
+    # numeric); log10 for popularity.
+    aggregated_to_score: Callable[[float], float]
+    # ``(scale_min, scale_max)`` for the colormap.  Difficulty depends
+    # on climb type (rope vs boulder bands); popularity ignores it.
+    scale_bounds_for: Callable[[ClimbTypeConfig], tuple[float, float]]
+    # Legend ticks: list of ``(display_label, numeric_score)`` pairs.
+    # The label is what the user sees ("5.10a", "10"); the score
+    # locates it on the gradient.  Per-climb-type because difficulty
+    # uses YDS for ropes and V-scale for boulders.
+    ticks_for: Callable[[ClimbTypeConfig], list[tuple[str, float]]]
+    # Subtitle text under the legend.  May contain a ``{agg}``
+    # placeholder for the aggregation method's label; for non-
+    # aggregation-aware metrics the placeholder is omitted and both
+    # mean/median subtitle spans render identical text.  Per-climb-type
+    # so difficulty can name the discipline ("sport-route", "boulder").
+    subtitle_template_for: Callable[[ClimbTypeConfig], str]
+    # Whether the metric's value differs between aggregation methods.
+    # ``True`` (default) means rows carry one column per ``(method,
+    # metric)`` pair (e.g. ``mean_difficulty`` / ``median_difficulty``)
+    # and the Mean/Median toggle visibly swaps the colour.  ``False``
+    # means rows carry one column total (named after ``row_suffix``)
+    # and the Mean/Median toggle has no visible effect when this metric
+    # is active -- the right call for popularity, where "sum of route
+    # views" doesn't have a mean-vs-median distinction.
+    aggregation_aware: bool = True
+
+
+# Difficulty metric: per-route grade → numeric score, with the per-climb-type
+# scale and tick grades already configured on ``ClimbTypeConfig``.
+def _difficulty_route_value(
+    route: dict, climb_type: ClimbTypeConfig
+) -> float | None:
+    return climb_type.grade_to_numeric(route.get(climb_type.grade_field))
+
+
+def _difficulty_ticks(
+    climb_type: ClimbTypeConfig,
+) -> list[tuple[str, float]]:
+    scale_min, scale_max = _scale_bounds(climb_type)
+    out: list[tuple[str, float]] = []
+    for label in climb_type.tick_grades:
+        score = climb_type.grade_to_numeric(label)
+        if score is None or score < scale_min or score > scale_max:
+            continue
+        out.append((label, float(score)))
+    return out
+
+
+DIFFICULTY = MetricConfig(
+    key="difficulty",
+    label="Difficulty",
+    palette=DIFFICULTY_COLOURS,
+    row_suffix="difficulty",
+    route_value=_difficulty_route_value,
+    aggregated_to_score=lambda x: x,                    # already numeric
+    scale_bounds_for=_scale_bounds,
+    ticks_for=_difficulty_ticks,
+    # ``ClimbTypeConfig.legend_subtitle`` already carries the ``{agg}``
+    # placeholder in the format expected by the legend swapper.
+    subtitle_template_for=lambda ct: ct.legend_subtitle,
+)
+
+
+# Popularity metric: per-route page-views/month → log-scaled score.  The
+# climb-type filter still applies (``aggregate_by_area`` only counts
+# routes whose ``type`` includes the active climb type's token), so
+# "Sport popularity" is "how popular are the sport routes here", not
+# "how popular is this area overall".
+def _popularity_route_value(
+    route: dict, _climb_type: ClimbTypeConfig
+) -> float | None:
+    views = route.get("page_views_per_month")
+    if views is None:
+        # Treat missing as zero rather than dropping the route -- a
+        # route can be a legitimate climb that just doesn't have view
+        # stats yet, and dropping it would also drop its difficulty
+        # contribution.  Zero clamps to log10(0.5) in _to_pop_score.
+        return 0.0
+    return float(views)
+
+
+def _popularity_scale_bounds(
+    _climb_type: ClimbTypeConfig,
+) -> tuple[float, float]:
+    return (_to_pop_score(POP_SCALE_MIN_VIEWS), _to_pop_score(POP_SCALE_MAX_VIEWS))
+
+
+def _popularity_ticks(
+    _climb_type: ClimbTypeConfig,
+) -> list[tuple[str, float]]:
+    return [(_format_views(v), _to_pop_score(v)) for v in POP_TICK_VIEWS]
+
+
+POPULARITY = MetricConfig(
+    key="popularity",
+    label="Popularity",
+    palette=POPULARITY_COLOURS,
+    row_suffix="popularity",
+    route_value=_popularity_route_value,
+    aggregated_to_score=_to_pop_score,
+    scale_bounds_for=_popularity_scale_bounds,
+    ticks_for=_popularity_ticks,
+    # No ``{agg}`` placeholder: popularity is a single sum per area, so
+    # both mean and median subtitle spans render the same text.  The
+    # Mean/Median toggle still flips between them but visually nothing
+    # changes when this metric is active.
+    subtitle_template_for=lambda _ct: (
+        f"Total route page-views per month "
+        f"({POP_SCALE_MIN_VIEWS}–{_format_views(POP_SCALE_MAX_VIEWS)})"
+    ),
+    aggregation_aware=False,
+)
+
+
+# Order matters: drives the radio-button order in the metric toggle and
+# the default-active metric (the first entry).
+METRICS: list[MetricConfig] = [DIFFICULTY, POPULARITY]
+DEFAULT_METRIC = METRICS[0]
+
+
+# ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
 
 def aggregate_by_area(
     payload: dict, climb_type: ClimbTypeConfig
 ) -> list[dict]:
-    """Aggregate a climb type's route difficulty per area, attaching GPS coords.
+    """Aggregate a climb type's per-route metrics per area, attaching GPS coords.
 
-    Both the mean and median per area are emitted on every row so the
-    in-browser aggregation toggle can swap between them without
-    re-running this function.
+    Every metric/aggregation combination is precomputed and stored on
+    each row so the in-browser toggles are pure visibility swaps — no
+    Python re-aggregation, no re-emit of the HTML.  Column layout
+    follows ``MetricConfig.aggregation_aware``: difficulty writes
+    ``mean_difficulty`` / ``median_difficulty`` (one per method);
+    popularity writes a single ``popularity`` column (sum of per-route
+    page-views, since "median sum" isn't a thing).
+
+    A route only contributes to an area's row if it produces a valid
+    *difficulty* score for the active climb type — that's the gate that
+    decides "is this a Sport route?" etc.  Popularity then sums the
+    page-view rates of those same routes, so swapping climb type
+    changes the route population for both metrics together.  The
+    popularity aggregation runs in linear views/month space; the log
+    transform that spreads the long tail across the colormap is applied
+    after — see :func:`_to_pop_score`.
 
     Aggregation keys on ``route_area_id`` -- the numeric ID embedded in
     the Mountain Project URL -- rather than the area name. Names are not
@@ -481,7 +730,11 @@ def aggregate_by_area(
     """
     areas_by_id = {a["id"]: a for a in payload.get("route_areas", []) if a.get("id")}
 
-    scores_by_id: dict[str, list[float]] = {}
+    # Per-area accumulators.  Difficulty scores gate inclusion;
+    # popularity is a running total per area in linear views/month
+    # space (log transform happens once at row-emit time).
+    diff_scores_by_id: dict[str, list[float]] = {}
+    pop_total_by_id: dict[str, float] = {}
     for route in payload.get("routes", []):
         if climb_type.type_token not in (route.get("type") or []):
             continue
@@ -493,10 +746,19 @@ def aggregate_by_area(
             # Older scrapes (pre route_area_id) won't aggregate; rather
             # than silently bucketing them under None, drop them.
             continue
-        scores_by_id.setdefault(area_id, []).append(score)
+        diff_scores_by_id.setdefault(area_id, []).append(score)
+        # Popularity uses the same gate -- routes that didn't parse for
+        # difficulty don't show up here either, so an "Unknown grade"
+        # sport route doesn't quietly inflate the area's popularity.
+        # ``_popularity_route_value`` returns 0.0 for missing views so
+        # we can sum unconditionally.
+        pop_total_by_id[area_id] = (
+            pop_total_by_id.get(area_id, 0.0)
+            + (_popularity_route_value(route, climb_type) or 0.0)
+        )
 
     rows: list[dict] = []
-    for area_id, scores in scores_by_id.items():
+    for area_id, scores in diff_scores_by_id.items():
         area = areas_by_id.get(area_id)
         if not area or not area.get("gps"):
             continue
@@ -506,11 +768,18 @@ def aggregate_by_area(
                 "name": area["name"],
                 "lat": area["gps"]["lat"],
                 "lon": area["gps"]["lon"],
+                "n_routes": len(scores),
+                # Difficulty: numeric scores live on the same scale the
+                # colormap reads, so no transform.
                 "mean_difficulty": sum(scores) / len(scores),
                 "median_difficulty": _median(scores),
                 "max_difficulty": max(scores),
                 "min_difficulty": min(scores),
-                "n_routes": len(scores),
+                # Popularity: sum of per-route page-views/month, log
+                # transformed so the colormap spreads the long tail.
+                # Single column (no mean/median variant) since sum
+                # doesn't have an aggregation-method distinction.
+                "popularity": _to_pop_score(pop_total_by_id[area_id]),
             }
         )
     return rows
@@ -519,12 +788,12 @@ def aggregate_by_area(
 # ---------------------------------------------------------------------------
 # Map rendering
 # ---------------------------------------------------------------------------
-
-# Cool-to-hot palette for the legend AND the per-area colour pick.  All
-# climb types share the palette; only the scale endpoints differ, so a
-# trad 5.10a and a sport 5.10a may render in different colours (each
-# scale is calibrated to its own discipline's distribution).
-DIFFICULTY_COLOURS = ["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"]
+#
+# Each metric's gradient is defined on its :class:`MetricConfig` (e.g.
+# :data:`DIFFICULTY_COLOURS` for difficulty, :data:`POPULARITY_COLOURS`
+# for popularity).  All climb types share each metric's palette; only
+# the scale endpoints differ for difficulty (rope vs boulder bands),
+# while popularity is climb-type-independent.
 
 
 def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
@@ -568,16 +837,22 @@ class _BlobsCanvasLayer(MacroElement):
     """A single canvas overlay that paints N radial-gradient blobs at once.
 
     Each entry in ``blobs`` carries the per-blob geometry plus one ``[r, g,
-    b]`` triple per supported aggregation method, in the same order as
-    :data:`AGGREGATION_METHODS`::
+    b]`` triple per ``(metric, aggregation_method)`` combination, in
+    metric-outer, aggregation-inner order matching :data:`METRICS` and
+    :data:`AGGREGATION_METHODS`. With M metrics and A methods that's
+    ``3 + M*A*3`` floats per blob. For example with 2 metrics × 2
+    methods::
 
-        [lat, lon, radius, mean_r, mean_g, mean_b, median_r, median_g, median_b]
+        [lat, lon, radius,
+         diff_mean_r,    diff_mean_g,    diff_mean_b,
+         diff_median_r,  diff_median_g,  diff_median_b,
+         pop_mean_r,     pop_mean_g,     pop_mean_b,
+         pop_median_r,   pop_median_g,   pop_median_b]
 
-    Which triple is drawn is decided at paint time by the global
-    ``window.__heatmapAggState`` set up by :class:`_AggregationState`. The
-    layer subscribes on add and re-draws when the user flips the toggle,
-    so swapping between Mean and Median is a redraw rather than a
-    layer-replacement.
+    Which triple is drawn is decided at paint time by the active values
+    on ``window.__heatmapMetricState`` and ``window.__heatmapAggState``.
+    The layer subscribes to both on add and re-draws when either flips,
+    so swapping between modes is a redraw rather than a layer-replacement.
     """
 
     _name = "BlobsCanvasLayer"
@@ -586,17 +861,31 @@ class _BlobsCanvasLayer(MacroElement):
         """
         {% macro script(this, kwargs) %}
         (function () {
-            var blobs   = {{ this.blobs | tojson }};
-            var aggKeys = {{ this.agg_keys | tojson }};
-            var map     = {{ this._parent.get_name() }};
+            var blobs      = {{ this.blobs | tojson }};
+            var metricKeys = {{ this.metric_keys | tojson }};
+            var aggKeys    = {{ this.agg_keys | tojson }};
+            var map        = {{ this._parent.get_name() }};
 
             // Index of the colour triple inside each blob entry for a
-            // given aggregation key. Mean lives at offset 3..5, median
-            // at 6..8, etc. -- one slot of three per method, in the
-            // same order Python emitted them.
-            var rgbOffsetByAgg = {};
-            for (var i = 0; i < aggKeys.length; i++) {
-                rgbOffsetByAgg[aggKeys[i]] = 3 + i * 3;
+            // given (metric, agg) pair. Triples are laid out in the
+            // same order Python emitted them: metric-outer,
+            // agg-inner. So with 2 metrics × 2 methods,
+            // (metric=0, agg=0) lives at 3..5, (0, 1) at 6..8,
+            // (1, 0) at 9..11, (1, 1) at 12..14.
+            var metricIdxByKey = {};
+            for (var m = 0; m < metricKeys.length; m++) {
+                metricIdxByKey[metricKeys[m]] = m;
+            }
+            var aggIdxByKey = {};
+            for (var a = 0; a < aggKeys.length; a++) {
+                aggIdxByKey[aggKeys[a]] = a;
+            }
+            function rgbOffsetFor(metricKey, aggKey) {
+                var m = metricIdxByKey[metricKey];
+                var a = aggIdxByKey[aggKey];
+                if (m === undefined) m = 0;
+                if (a === undefined) a = 0;
+                return 3 + (m * aggKeys.length + a) * 3;
             }
 
             var BlobsLayer = L.Layer.extend({
@@ -631,13 +920,17 @@ class _BlobsCanvasLayer(MacroElement):
                     canvas.style.pointerEvents = 'none';
                     pane.appendChild(canvas);
                     map.on('moveend resize zoomend', this._reset, this);
-                    // Re-paint when the aggregation toggle flips. The
-                    // unsubscribe handle is stashed so onRemove can stop
-                    // listening when this layer is swapped out by the
-                    // climb-type radio.
+                    // Re-paint when either toggle flips. Unsubscribe
+                    // handles are stashed so onRemove can stop listening
+                    // when this layer is swapped out by the climb-type
+                    // radio.
                     var self = this;
                     this._unsubscribeAgg =
                         window.__heatmapAggState.subscribe(function () {
+                            self._reset();
+                        });
+                    this._unsubscribeMetric =
+                        window.__heatmapMetricState.subscribe(function () {
                             self._reset();
                         });
                     this._reset();
@@ -648,6 +941,10 @@ class _BlobsCanvasLayer(MacroElement):
                     if (this._unsubscribeAgg) {
                         this._unsubscribeAgg();
                         this._unsubscribeAgg = null;
+                    }
+                    if (this._unsubscribeMetric) {
+                        this._unsubscribeMetric();
+                        this._unsubscribeMetric = null;
                     }
                 },
                 _reset: function () {
@@ -675,13 +972,12 @@ class _BlobsCanvasLayer(MacroElement):
                     );
                     var map = this._map;
                     // Resolve the active colour triple offset once per
-                    // redraw; falling back to mean if the state ever
-                    // names a method we didn't render for.
-                    var activeAgg = window.__heatmapAggState.get();
-                    var rgbOffset = rgbOffsetByAgg[activeAgg];
-                    if (rgbOffset === undefined) {
-                        rgbOffset = rgbOffsetByAgg[aggKeys[0]];
-                    }
+                    // redraw based on the current (metric, agg) pair.
+                    // Unknown keys fall back to the first metric/method
+                    // -- belt-and-braces in case state desynchronises.
+                    var activeMetric = window.__heatmapMetricState.get();
+                    var activeAgg    = window.__heatmapAggState.get();
+                    var rgbOffset    = rgbOffsetFor(activeMetric, activeAgg);
                     // Pad the visible bounds so blobs whose centre is just
                     // off-screen still paint their visible halo.  Padding
                     // is generous because the largest blobs can extend a
@@ -723,9 +1019,15 @@ class _BlobsCanvasLayer(MacroElement):
         """
     )
 
-    def __init__(self, blobs: list[list], agg_keys: list[str]) -> None:
+    def __init__(
+        self,
+        blobs: list[list],
+        metric_keys: list[str],
+        agg_keys: list[str],
+    ) -> None:
         super().__init__()
         self.blobs = blobs
+        self.metric_keys = metric_keys
         self.agg_keys = agg_keys
 
 
@@ -859,12 +1161,132 @@ class _AggregationToggle(MacroElement):
         self.default_key = default_key
 
 
+# ---------------------------------------------------------------------------
+# Metric toggle: shared state + UI control.
+# ---------------------------------------------------------------------------
+#
+# Mirrors the aggregation toggle but on a different axis (which metric
+# is colour-encoded). Lives on its own ``window.__heatmapMetricState`` so
+# blob canvases and the legend swapper can subscribe to one or both
+# state objects independently.
+
+class _MetricState(MacroElement):
+    """Inject a tiny pub/sub state holder for the active metric.
+
+    Same shape as :class:`_AggregationState` (``get`` / ``set`` / ``subscribe``)
+    but the state object is published at ``window.__heatmapMetricState`` so
+    the two axes don't collide. Emitted exactly once at the map level so
+    the state survives base-layer toggles.
+    """
+
+    _name = "MetricState"
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function () {
+            if (window.__heatmapMetricState) { return; }
+            var current = {{ this.default_key | tojson }};
+            var subs = [];
+            window.__heatmapMetricState = {
+                get: function () { return current; },
+                set: function (next) {
+                    if (next === current) { return; }
+                    current = next;
+                    for (var i = 0; i < subs.length; i++) {
+                        try { subs[i](current); } catch (e) { /* ignore */ }
+                    }
+                },
+                subscribe: function (fn) {
+                    subs.push(fn);
+                    return function () {
+                        var idx = subs.indexOf(fn);
+                        if (idx !== -1) { subs.splice(idx, 1); }
+                    };
+                }
+            };
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(self, default_key: str) -> None:
+        super().__init__()
+        self.default_key = default_key
+
+
+class _MetricToggle(MacroElement):
+    """Render a small radio control that flips ``window.__heatmapMetricState``.
+
+    Sits below :class:`_AggregationToggle` (top-right corner) so the two
+    orthogonal toggles stack visually. Same panel styling for visual
+    consistency with the other controls.
+    """
+
+    _name = "MetricToggle"
+
+    _template = Template(
+        """
+        {% macro html(this, kwargs) %}
+        <div class="metric-toggle" style="
+            position: fixed;
+            top: 250px;
+            right: 10px;
+            background: rgba(255,255,255,0.95);
+            padding: 8px 12px;
+            border: 2px solid rgba(0,0,0,0.2);
+            border-radius: 4px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+            z-index: 1000;
+            font-family: sans-serif;
+            font-size: 13px;
+            color: #222;
+        ">
+            <div style="font-weight:bold;margin-bottom:4px;">Metric</div>
+            {% for metric in this.metrics %}
+            <label style="display:block;cursor:pointer;line-height:1.6;">
+                <input type="radio"
+                       name="heatmap-metric"
+                       value="{{ metric.key }}"
+                       {% if metric.key == this.default_key %}checked{% endif %}
+                       style="margin-right:6px;vertical-align:middle;">
+                {{ metric.label }}
+            </label>
+            {% endfor %}
+        </div>
+        {% endmacro %}
+
+        {% macro script(this, kwargs) %}
+        (function () {
+            var inputs = document.querySelectorAll(
+                '.metric-toggle input[name="heatmap-metric"]'
+            );
+            inputs.forEach(function (el) {
+                el.addEventListener('change', function () {
+                    if (el.checked) {
+                        window.__heatmapMetricState.set(el.value);
+                    }
+                });
+            });
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(
+        self, metrics: list[MetricConfig], default_key: str,
+    ) -> None:
+        super().__init__()
+        self.metrics = metrics
+        self.default_key = default_key
+
+
 def _populate_climb_type_layer(
     feature_group: folium.FeatureGroup,
     rows: list[dict],
     climb_type: ClimbTypeConfig,
 ) -> None:
-    """Attach this climb type's difficulty blobs and click-target dots to ``feature_group``.
+    """Attach this climb type's blobs and click-target dots to ``feature_group``.
 
     Each FeatureGroup is added to the map as a base layer (``overlay=False``),
     so when the user picks a different climb type from the layer-control radio
@@ -874,50 +1296,59 @@ def _populate_climb_type_layer(
     if not rows:
         return
 
-    scale_min, scale_max = _scale_bounds(climb_type)
-
-    # Map each area's mean difficulty to a single hue using a colormap whose
-    # domain is focused on this climb type's typical band.  Easier areas
-    # saturate to the coolest colour; harder areas saturate to the hottest —
-    # branca's LinearColormap.__call__ clamps inputs outside [vmin, vmax] to
-    # the endpoint colours, so no special handling is needed for the tails.
+    # Pre-compute one colormap per metric, scaled to that metric's
+    # focused band for this climb type. Difficulty depends on climb type
+    # (rope vs boulder); popularity is climb-type-independent (the same
+    # 1–100 views/month band) but we still resolve it through the
+    # MetricConfig API so adding metrics later doesn't require special
+    # cases here.
     #
-    # We DON'T add this colormap to the map directly: branca renders it with
-    # numeric tick labels, and the internal numeric scale is meant to stay
-    # invisible to the user.  See ``_build_legend_html`` below for the
-    # custom YDS/V-labelled legend we render instead.
-    colormap = cm.LinearColormap(
-        DIFFICULTY_COLOURS, vmin=scale_min, vmax=scale_max,
-    )
+    # We DON'T add these colormaps to the map directly: branca renders
+    # them with numeric tick labels, and the internal numeric scale is
+    # meant to stay invisible to the user. See ``_build_legend_html``
+    # below for the custom legends we render instead.
+    colormaps_by_metric: dict[str, tuple[cm.LinearColormap, float, float]] = {}
+    for metric in METRICS:
+        scale_min, scale_max = metric.scale_bounds_for(climb_type)
+        colormap = cm.LinearColormap(
+            metric.palette, vmin=scale_min, vmax=scale_max,
+        )
+        colormaps_by_metric[metric.key] = (colormap, scale_min, scale_max)
 
-    # Build one blob per area: colour comes from the difficulty colormap
-    # (quantised into discrete buckets so similar-grade crags share a hue),
-    # radius comes from the area's route count (sqrt-scaled so blob *area*
-    # is what's proportional to the count -- see _radius_for_n_routes).
+    # Build one blob per area. Radius comes from the area's route count
+    # (sqrt-scaled so blob *area* is what's proportional to the count --
+    # see _radius_for_n_routes); colour comes from each metric's
+    # colormap, quantised into discrete buckets so similar-value crags
+    # share a hue.
+    #
     # All blobs paint into a single shared canvas via _BlobsCanvasLayer,
-    # which keeps rendering fast at hundreds of areas.  Adding the layer
-    # to the FeatureGroup (rather than directly to the map) means it gets
-    # added/removed automatically when the climb-type radio toggles which
-    # FeatureGroup is the active base layer.
+    # which keeps rendering fast at hundreds of areas. Adding the layer
+    # to the FeatureGroup (rather than directly to the map) means it
+    # gets added/removed automatically when the climb-type radio toggles
+    # which FeatureGroup is the active base layer.
     #
-    # Each blob carries one ``(r, g, b)`` triple per supported aggregation
-    # method (mean, median) so the toggle only has to redraw — it doesn't
-    # have to recompute. The order MUST match ``AGGREGATION_METHODS`` so
-    # the canvas layer's offset lookup lines up.
+    # Each blob carries one ``(r, g, b)`` triple per ``(metric,
+    # aggregation_method)`` pair, in metric-outer / aggregation-inner
+    # order. The order MUST match ``METRICS`` and ``AGGREGATION_METHODS``
+    # so the canvas layer's offset lookup lines up.
     blobs: list[list[float]] = []
     for row in rows:
         radius = _radius_for_n_routes(row["n_routes"])
         entry: list[float] = [row["lat"], row["lon"], radius]
-        for method in AGGREGATION_METHODS:
-            bucket = _quantize_to_bucket(
-                row[method.field], scale_min, scale_max,
-            )
-            r, g, b = _hex_to_rgb(colormap(bucket))
-            entry.extend((r, g, b))
+        for metric in METRICS:
+            colormap, scale_min, scale_max = colormaps_by_metric[metric.key]
+            for method in AGGREGATION_METHODS:
+                bucket = _quantize_to_bucket(
+                    row[_row_field(method, metric)], scale_min, scale_max,
+                )
+                r, g, b = _hex_to_rgb(colormap(bucket))
+                entry.extend((r, g, b))
         blobs.append(entry)
 
     _BlobsCanvasLayer(
-        blobs, agg_keys=[m.key for m in AGGREGATION_METHODS],
+        blobs,
+        metric_keys=[m.key for m in METRICS],
+        agg_keys=[a.key for a in AGGREGATION_METHODS],
     ).add_to(feature_group)
 
     # A small black dot at each area's GPS point makes the source obvious
@@ -1044,12 +1475,13 @@ def build_heatmap(
         control=False,
     ).add_to(fmap)
 
-    # Inject the aggregation state holder BEFORE any FeatureGroup is
-    # populated. The blob canvas layers subscribe to it on add, and on
-    # initial page load Leaflet adds the default base layer (which adds
-    # its blob canvas) before the layer control is wired up — so the
-    # state object has to exist by then.
+    # Inject both state holders BEFORE any FeatureGroup is populated.
+    # The blob canvas layers subscribe to both on add, and on initial
+    # page load Leaflet adds the default base layer (which adds its
+    # blob canvas) before the layer control is wired up — so the state
+    # objects have to exist by then.
     fmap.add_child(_AggregationState(DEFAULT_AGGREGATION.key))
+    fmap.add_child(_MetricState(DEFAULT_METRIC.key))
 
     # One FeatureGroup per active climb type, registered as a *base layer*
     # (overlay=False) so folium's LayerControl renders them as a
@@ -1077,24 +1509,31 @@ def build_heatmap(
     ).add_to(fmap)
 
     # Aggregation-method radio sits below the climb-type LayerControl;
-    # flipping it pushes the new key into ``window.__heatmapAggState``,
+    # the metric radio sits below the aggregation one.  Flipping either
+    # pushes the new key into the corresponding ``window.__heatmap*State``,
     # which the blob canvas + legend subscribers pick up.
     fmap.add_child(
         _AggregationToggle(AGGREGATION_METHODS, DEFAULT_AGGREGATION.key),
     )
+    fmap.add_child(
+        _MetricToggle(METRICS, DEFAULT_METRIC.key),
+    )
 
-    # Render every climb type's legend in the same fixed position; only
-    # the default starts visible.  The ``LegendSwapper`` macro below
-    # listens for ``baselayerchange`` AND aggregation state changes and
-    # toggles both block visibility and per-block subtitle visibility.
+    # Render every (climb_type, metric) combination's legend in the
+    # same fixed position; only the default-default starts visible.
+    # The ``LegendSwapper`` macro below listens for ``baselayerchange``
+    # AND both state changes, and toggles block visibility plus
+    # per-block subtitle visibility accordingly.
     legend_blocks = "".join(
         _build_legend_html(
             ct,
-            hidden=(ct is not default_type),
+            metric,
+            hidden=(ct is not default_type or metric is not DEFAULT_METRIC),
             aggregation_methods=AGGREGATION_METHODS,
             default_aggregation=DEFAULT_AGGREGATION,
         )
         for ct in active_types
+        for metric in METRICS
     )
     fmap.get_root().html.add_child(folium.Element(legend_blocks))
     fmap.add_child(_LegendSwapper(default_type.label))
@@ -1106,15 +1545,17 @@ def build_heatmap(
 
 class _LegendSwapper(MacroElement):
     """Swap which legend block + subtitle is visible based on the active
-    climb type and aggregation method.
+    climb type, metric, and aggregation method.
 
-    Folium's LayerControl emits Leaflet's ``baselayerchange`` event with the
-    layer's display name on ``e.name`` — that matches the ``label`` field on
-    each ``ClimbTypeConfig``, which is also written into the legend block's
-    ``data-climb-type`` attribute. The aggregation toggle pushes its key
-    through ``window.__heatmapAggState``; each block carries one subtitle
-    span per method tagged with ``data-agg``, and we only show the one
-    matching the current state.
+    There is one legend block per ``(climb_type, metric)`` pair, tagged
+    with ``data-climb-type`` and ``data-metric`` attributes.  Folium's
+    LayerControl emits Leaflet's ``baselayerchange`` event with the
+    layer's display name on ``e.name``, matching the ``label`` field on
+    each :class:`ClimbTypeConfig`. The metric and aggregation toggles
+    push their keys through ``window.__heatmapMetricState`` and
+    ``window.__heatmapAggState`` respectively. Inside each legend block,
+    the subtitle line carries one ``<span class="legend-subtitle">`` per
+    aggregation method tagged with ``data-agg``.
     """
 
     _name = "LegendSwapper"
@@ -1136,18 +1577,22 @@ class _LegendSwapper(MacroElement):
                 });
             }
             function refresh() {
-                var aggKey = window.__heatmapAggState.get();
+                var aggKey    = window.__heatmapAggState.get();
+                var metricKey = window.__heatmapMetricState.get();
                 var legends = document.querySelectorAll(
-                    '.difficulty-legend[data-climb-type]'
+                    '.metric-legend[data-climb-type][data-metric]'
                 );
                 legends.forEach(function (el) {
-                    var visible = (el.dataset.climbType === activeClimbType);
+                    var visible = (
+                        el.dataset.climbType === activeClimbType
+                        && el.dataset.metric === metricKey
+                    );
                     el.style.display = visible ? 'block' : 'none';
-                    // Keep all blocks' subtitle state in sync with the
-                    // active aggregation, even hidden ones — that way
-                    // when the user later flips the climb-type radio the
-                    // newly-revealed block already shows the right
-                    // subtitle without an extra paint.
+                    // Keep every block's subtitle state in sync with
+                    // the active aggregation -- even hidden ones --
+                    // so when the user later flips the climb-type or
+                    // metric radio the newly-revealed block already
+                    // shows the right subtitle without an extra paint.
                     showSubtitleFor(el, aggKey);
                 });
             }
@@ -1159,9 +1604,12 @@ class _LegendSwapper(MacroElement):
             window.__heatmapAggState.subscribe(function () {
                 refresh();
             });
-            // Run once on load so the default layer's legend (and the
-            // default aggregation's subtitle) is visible even if the
-            // user never toggles either control.
+            window.__heatmapMetricState.subscribe(function () {
+                refresh();
+            });
+            // Run once on load so the default (climb_type, metric,
+            // aggregation) combo's legend is visible even if the user
+            // never toggles any control.
             refresh();
         })();
         {% endmacro %}
@@ -1175,40 +1623,44 @@ class _LegendSwapper(MacroElement):
 
 def _build_legend_html(
     climb_type: ClimbTypeConfig,
+    metric: MetricConfig,
     *,
     hidden: bool,
     aggregation_methods: list[AggregationMethod],
     default_aggregation: AggregationMethod,
 ) -> str:
-    """Return an HTML overlay that mirrors the colormap with grade tick labels.
+    """Return an HTML overlay that mirrors a metric's colormap with tick labels.
 
     We can't reuse branca's built-in legend: it renders ticks from ``vmin``
     to ``vmax`` as raw numbers, which would expose the internal numeric
-    scale.  Instead, we paint a CSS gradient that matches
-    :data:`DIFFICULTY_COLOURS` and pin a handful of recognisable grades
-    (YDS or V-scale, depending on the climb type) at the same proportional
+    scale (e.g. ``log10(views) * 20`` for popularity).  Instead, we paint
+    a CSS gradient that matches the metric's palette and pin a handful of
+    recognisable labels (YDS / V-scale grades for difficulty;
+    "1 / 10 / 100 views/mo" for popularity) at the same proportional
     positions they occupy on the (focused) numeric scale.
 
     The block carries one ``<span class="legend-subtitle">`` per
-    aggregation method (formed from ``climb_type.legend_subtitle`` with
-    ``{agg}`` filled in). :class:`_LegendSwapper` toggles which block AND
-    which subtitle is visible based on the active climb type and
-    aggregation key.
+    aggregation method (formed from ``metric.subtitle_template_for(climb_type)``
+    with ``{agg}`` filled in). :class:`_LegendSwapper` toggles which
+    block AND which subtitle is visible based on the active climb type,
+    metric, and aggregation keys.
     """
-    scale_min, scale_max = _scale_bounds(climb_type)
+    scale_min, scale_max = metric.scale_bounds_for(climb_type)
     span = scale_max - scale_min
 
+    # Per-metric tick spec: list of (display_label, numeric_score).
+    # Convert each tick's score into its proportional position on the
+    # gradient.
     ticks: list[tuple[str, float]] = []
-    for label in climb_type.tick_grades:
-        score = climb_type.grade_to_numeric(label)
-        if score is None:
-            continue
+    for label, score in metric.ticks_for(climb_type):
         if score < scale_min or score > scale_max:
             continue
         pct = (score - scale_min) / span * 100
         ticks.append((label, pct))
 
-    gradient_css = f"linear-gradient(to right, {', '.join(DIFFICULTY_COLOURS)})"
+    gradient_css = (
+        f"linear-gradient(to right, {', '.join(metric.palette)})"
+    )
 
     label_spans = "".join(
         (
@@ -1228,13 +1680,14 @@ def _build_legend_html(
     )
 
     # One subtitle per aggregation method, only the default-active one
-    # rendered with ``display:block``. The legend swapper flips these on
-    # state changes; the rest stay in the DOM ready to swap.
+    # rendered with ``display:block``. The legend swapper flips these
+    # on state changes; the rest stay in the DOM ready to swap.
+    subtitle_template = metric.subtitle_template_for(climb_type)
     subtitle_spans = "".join(
         (
             f'<span class="legend-subtitle" data-agg="{method.key}" '
             f'style="display:{"block" if method is default_aggregation else "none"};">'
-            f'{climb_type.legend_subtitle.format(agg=method.label)}'
+            f'{subtitle_template.format(agg=method.label)}'
             f'</span>'
         )
         for method in aggregation_methods
@@ -1243,7 +1696,10 @@ def _build_legend_html(
     display = "none" if hidden else "block"
 
     return f"""
-    <div class="difficulty-legend" data-climb-type="{climb_type.label}" style="
+    <div class="metric-legend"
+         data-climb-type="{climb_type.label}"
+         data-metric="{metric.key}"
+         style="
         display: {display};
         position: fixed;
         bottom: 24px;
