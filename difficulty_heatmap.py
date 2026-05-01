@@ -7,14 +7,17 @@ For every JSON file in ``data/`` we, for each supported climb type
      boulders; in both cases a full-grade jump is 4 points and the
      within-grade modifiers are 1 point apart),
   3. aggregate per route area, on two orthogonal axes:
-       * **metric** -- difficulty (numeric grade, aggregated as mean or
-         median) or popularity (the area's total route page-views per
-         month for routes of the active climb type, log-transformed so
-         the long tail spreads across the colour gradient),
+       * **metric** -- one of:
+           - difficulty (numeric grade, aggregated as mean or median);
+           - popularity (total) -- the area's summed route page-views
+             per month for routes of the active climb type;
+           - popularity (average) -- the per-route mean of the same.
+         Both popularity variants are log-transformed so the long tail
+         spreads across the colour gradient.
        * **aggregation method** -- mean or median.  Only applies to
-         difficulty; popularity is a single sum per area, so the
-         Mean/Median toggle has no visible effect when popularity is
-         the active metric.
+         difficulty; both popularity variants are single values per
+         area, so the Mean/Median toggle has no visible effect when
+         either popularity metric is active.
      All values are precomputed per area and the user toggles between
      them at view time,
   4. render each area as a colour-coded blob on a Folium map.
@@ -523,19 +526,29 @@ POPULARITY_COLOURS = ["#440154", "#3b528b", "#21918c", "#5ec962", "#fde725"]
 # (factor 20 ⇒ ~20 buckets per order of magnitude).
 POP_LOG_SCALE_FACTOR = 20
 
-# Display range for popularity: 10 → 1000 total views/month per area
-# covers roughly the median through p99 across all climb types in a
-# typical scrape (Boulder Canyon median sport area ≈ 43, p99 ≈ 572,
-# max ≈ 864; trad/boulder distributions sit close to that).  Areas
-# above 1000/mo saturate to the hottest colour, which is the right
-# visual story for a "very popular crag" — the legend stays readable
-# instead of being stretched to fit rare megaclassics.
-POP_SCALE_MIN_VIEWS = 10
-POP_SCALE_MAX_VIEWS = 1000
+# Two popularity variants share the same palette and log transform but
+# operate on different scales:
+#
+# * ``POPULARITY_TOTAL``: sum of per-route page-views per month within
+#   an area.  Heavy long-tail at the area level (10s for a quiet crag,
+#   1000+ for a mega-classic crag), so we colour-map across 10 → 1000.
+#   Boulder Canyon: median sport area ≈ 43, p99 ≈ 572, max ≈ 864.
+# * ``POPULARITY_AVERAGE``: mean of per-route page-views per month.
+#   Decoupled from area size, so a small-but-busy crag and a big-but-
+#   obscure one are visually distinct.  Range is roughly an order of
+#   magnitude tighter than total, so we colour-map across 1 → 100.
+#   Boulder Canyon route page-views: median ≈ 9, p99 ≈ 75, max ≈ 293.
+#
+# Areas above each variant's max saturate to the hottest colour, which
+# is the right visual story for a "very popular crag" — the legend
+# stays readable instead of being stretched to fit rare megaclassics.
+POP_TOTAL_SCALE_MIN_VIEWS = 10
+POP_TOTAL_SCALE_MAX_VIEWS = 1000
+POP_TOTAL_TICK_VIEWS = [10, 30, 100, 300, 1000]
 
-# Tick positions for the popularity legend: log-spaced so each step is
-# half an order of magnitude.
-POP_TICK_VIEWS = [10, 30, 100, 300, 1000]
+POP_AVG_SCALE_MIN_VIEWS = 1
+POP_AVG_SCALE_MAX_VIEWS = 100
+POP_AVG_TICK_VIEWS = [1, 3, 10, 30, 100]
 
 
 def _to_pop_score(views_per_month: float) -> float:
@@ -633,11 +646,21 @@ DIFFICULTY = MetricConfig(
 )
 
 
-# Popularity metric: per-route page-views/month → log-scaled score.  The
-# climb-type filter still applies (``aggregate_by_area`` only counts
+# Popularity metrics: per-route page-views/month → log-scaled score.
+# The climb-type filter still applies (``aggregate_by_area`` only counts
 # routes whose ``type`` includes the active climb type's token), so
 # "Sport popularity" is "how popular are the sport routes here", not
-# "how popular is this area overall".
+# "how popular is this area overall".  Two variants:
+#
+# * Total — sum of route views in the area.  Correlates with area size
+#   (a big crag with average traffic still sums to a lot of views), so
+#   visually answers "where are the crowds in absolute terms".
+# * Average — mean of route views in the area.  Decoupled from area
+#   size, so visually answers "are the typical routes here popular,
+#   regardless of how many of them there are".
+#
+# Both share the palette, log transform, and tick-format helpers; only
+# the scale bounds and tick lists differ.
 def _popularity_route_value(
     route: dict, _climb_type: ClimbTypeConfig
 ) -> float | None:
@@ -651,42 +674,78 @@ def _popularity_route_value(
     return float(views)
 
 
-def _popularity_scale_bounds(
-    _climb_type: ClimbTypeConfig,
-) -> tuple[float, float]:
-    return (_to_pop_score(POP_SCALE_MIN_VIEWS), _to_pop_score(POP_SCALE_MAX_VIEWS))
+def _make_popularity_metric(
+    *,
+    key: str,
+    label: str,
+    row_suffix: str,
+    scale_min_views: int,
+    scale_max_views: int,
+    tick_views: list[int],
+    subtitle_lead: str,
+) -> MetricConfig:
+    """Build a popularity metric variant.
+
+    Both Total and Average share the same palette / log transform /
+    aggregation-unaware shape; they differ only in scale bounds, tick
+    list, and the subtitle's leading word ("Total" / "Average").
+    """
+    def scale_bounds_for(_ct: ClimbTypeConfig) -> tuple[float, float]:
+        return (_to_pop_score(scale_min_views), _to_pop_score(scale_max_views))
+
+    def ticks_for(_ct: ClimbTypeConfig) -> list[tuple[str, float]]:
+        return [(_format_views(v), _to_pop_score(v)) for v in tick_views]
+
+    def subtitle_template_for(_ct: ClimbTypeConfig) -> str:
+        # No ``{agg}`` placeholder: popularity is a single value per
+        # area regardless of mean/median, so both subtitle spans
+        # render the same text and the Mean/Median toggle has no
+        # visible effect when this metric is active.
+        return (
+            f"{subtitle_lead} route page-views per month "
+            f"({scale_min_views}–{_format_views(scale_max_views)})"
+        )
+
+    return MetricConfig(
+        key=key,
+        label=label,
+        palette=POPULARITY_COLOURS,
+        row_suffix=row_suffix,
+        route_value=_popularity_route_value,
+        aggregated_to_score=_to_pop_score,
+        scale_bounds_for=scale_bounds_for,
+        ticks_for=ticks_for,
+        subtitle_template_for=subtitle_template_for,
+        aggregation_aware=False,
+    )
 
 
-def _popularity_ticks(
-    _climb_type: ClimbTypeConfig,
-) -> list[tuple[str, float]]:
-    return [(_format_views(v), _to_pop_score(v)) for v in POP_TICK_VIEWS]
+POPULARITY_TOTAL = _make_popularity_metric(
+    key="popularity_total",
+    label="Popularity (Total)",
+    row_suffix="popularity_total",
+    scale_min_views=POP_TOTAL_SCALE_MIN_VIEWS,
+    scale_max_views=POP_TOTAL_SCALE_MAX_VIEWS,
+    tick_views=POP_TOTAL_TICK_VIEWS,
+    subtitle_lead="Total",
+)
 
-
-POPULARITY = MetricConfig(
-    key="popularity",
-    label="Popularity",
-    palette=POPULARITY_COLOURS,
-    row_suffix="popularity",
-    route_value=_popularity_route_value,
-    aggregated_to_score=_to_pop_score,
-    scale_bounds_for=_popularity_scale_bounds,
-    ticks_for=_popularity_ticks,
-    # No ``{agg}`` placeholder: popularity is a single sum per area, so
-    # both mean and median subtitle spans render the same text.  The
-    # Mean/Median toggle still flips between them but visually nothing
-    # changes when this metric is active.
-    subtitle_template_for=lambda _ct: (
-        f"Total route page-views per month "
-        f"({POP_SCALE_MIN_VIEWS}–{_format_views(POP_SCALE_MAX_VIEWS)})"
-    ),
-    aggregation_aware=False,
+POPULARITY_AVERAGE = _make_popularity_metric(
+    key="popularity_average",
+    label="Popularity (Average)",
+    row_suffix="popularity_average",
+    scale_min_views=POP_AVG_SCALE_MIN_VIEWS,
+    scale_max_views=POP_AVG_SCALE_MAX_VIEWS,
+    tick_views=POP_AVG_TICK_VIEWS,
+    subtitle_lead="Average",
 )
 
 
 # Order matters: drives the radio-button order in the metric toggle and
-# the default-active metric (the first entry).
-METRICS: list[MetricConfig] = [DIFFICULTY, POPULARITY]
+# the default-active metric (the first entry).  Difficulty stays first
+# (the original / most common use); the two popularity variants follow,
+# Total before Average to put the more "obvious" interpretation first.
+METRICS: list[MetricConfig] = [DIFFICULTY, POPULARITY_TOTAL, POPULARITY_AVERAGE]
 DEFAULT_METRIC = METRICS[0]
 
 
@@ -703,18 +762,20 @@ def aggregate_by_area(
     each row so the in-browser toggles are pure visibility swaps — no
     Python re-aggregation, no re-emit of the HTML.  Column layout
     follows ``MetricConfig.aggregation_aware``: difficulty writes
-    ``mean_difficulty`` / ``median_difficulty`` (one per method);
-    popularity writes a single ``popularity`` column (sum of per-route
-    page-views, since "median sum" isn't a thing).
+    ``mean_difficulty`` / ``median_difficulty`` (one per method); the
+    two popularity variants each write a single column
+    (``popularity_total`` = sum of per-route views;
+    ``popularity_average`` = mean of per-route views) since "median
+    sum" / "median average" aren't meaningful distinctions.
 
     A route only contributes to an area's row if it produces a valid
     *difficulty* score for the active climb type — that's the gate that
-    decides "is this a Sport route?" etc.  Popularity then sums the
-    page-view rates of those same routes, so swapping climb type
-    changes the route population for both metrics together.  The
-    popularity aggregation runs in linear views/month space; the log
-    transform that spreads the long tail across the colormap is applied
-    after — see :func:`_to_pop_score`.
+    decides "is this a Sport route?" etc.  Popularity then aggregates
+    the page-view rates of those same routes, so swapping climb type
+    changes the route population for every metric together.  Popularity
+    aggregation runs in linear views/month space; the log transform
+    that spreads the long tail across the colormap is applied after
+    — see :func:`_to_pop_score`.
 
     Aggregation keys on ``route_area_id`` -- the numeric ID embedded in
     the Mountain Project URL -- rather than the area name. Names are not
@@ -762,24 +823,29 @@ def aggregate_by_area(
         area = areas_by_id.get(area_id)
         if not area or not area.get("gps"):
             continue
+        n = len(scores)
+        total_views = pop_total_by_id[area_id]
         rows.append(
             {
                 "id": area_id,
                 "name": area["name"],
                 "lat": area["gps"]["lat"],
                 "lon": area["gps"]["lon"],
-                "n_routes": len(scores),
+                "n_routes": n,
                 # Difficulty: numeric scores live on the same scale the
                 # colormap reads, so no transform.
-                "mean_difficulty": sum(scores) / len(scores),
+                "mean_difficulty": sum(scores) / n,
                 "median_difficulty": _median(scores),
                 "max_difficulty": max(scores),
                 "min_difficulty": min(scores),
-                # Popularity: sum of per-route page-views/month, log
-                # transformed so the colormap spreads the long tail.
-                # Single column (no mean/median variant) since sum
-                # doesn't have an aggregation-method distinction.
-                "popularity": _to_pop_score(pop_total_by_id[area_id]),
+                # Popularity: aggregate in linear views/month space,
+                # log transformed so the colormap spreads the long
+                # tail.  Two single-column variants -- "Total" =
+                # sum across the area's routes, "Average" = mean
+                # per route -- pre-baked so the metric toggle is a
+                # visibility swap.
+                "popularity_total": _to_pop_score(total_views),
+                "popularity_average": _to_pop_score(total_views / n),
             }
         )
     return rows
