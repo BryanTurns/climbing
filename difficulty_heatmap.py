@@ -890,15 +890,15 @@ def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
 _METRES_PER_MILE = 1609.344
 
 # Pixel target (sqrt-scaled by n_routes, zoom-independent).
-MIN_BLOB_RADIUS_PX = 30      # floor so 1-route areas stay visible
+MIN_BLOB_RADIUS_PX = 40      # floor so 1-route areas stay visible
 MAX_BLOB_RADIUS_PX = 140     # cap so a 500-route crag doesn't dominate
 BLOB_RADIUS_SCALE_PX = 22    # multiplier on sqrt(n_routes)
 
 # Geographic ceiling (metres). The pixel-equivalent of this distance is
 # the upper bound on a blob's screen radius.
 MIN_BLOB_RADIUS_M = 1 * _METRES_PER_MILE      # ~1 mi
-MAX_BLOB_RADIUS_M = 10 * _METRES_PER_MILE     # ~10 mi
-BLOB_RADIUS_SCALE_M = 1.5 * _METRES_PER_MILE  # ~1.5 mi · sqrt(n_routes); cap engages around n=44
+MAX_BLOB_RADIUS_M = 20 * _METRES_PER_MILE     # ~10 mi
+BLOB_RADIUS_SCALE_M = 3 * _METRES_PER_MILE  # ~1.5 mi · sqrt(n_routes); cap engages around n=44
 
 
 def _radius_for_n_routes(n_routes: int) -> tuple[float, float]:
