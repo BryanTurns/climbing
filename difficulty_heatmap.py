@@ -872,17 +872,24 @@ def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
 # proportional to the route count rather than its radius — otherwise a
 # 100-route crag would render with 100x the visual mass of a 1-route one and
 # swamp the map. Bounds keep tiny areas legible and stop a single mega-area
-# from eating the whole viewport at low zoom levels.
-MIN_BLOB_RADIUS = 30      # pixels; floor so 1-route areas are still visible
-MAX_BLOB_RADIUS = 140     # pixels; cap so a 500-route crag doesn't dominate
-BLOB_RADIUS_SCALE = 22    # multiplier on sqrt(n_routes)
+# from eating the whole viewport.
+#
+# Radii are expressed in METRES, not pixels, so blobs shrink on screen as the
+# user zooms out. A pixel radius would stay the same screen size at every
+# zoom, which made country-level views misleading: a 30 px blob covers tens
+# of miles at zoom 5, so empty states looked colored. The canvas layer
+# converts metres to pixels per redraw using the map's current projection.
+_METRES_PER_MILE = 1609.344
+MIN_BLOB_RADIUS_M = 1 * _METRES_PER_MILE      # ~1 mi floor so 1-route areas are visible at mid zoom
+MAX_BLOB_RADIUS_M = 10 * _METRES_PER_MILE     # ~10 mi cap so big crags don't bleed across state lines
+BLOB_RADIUS_SCALE_M = 1.5 * _METRES_PER_MILE  # ~1.5 mi · sqrt(n_routes); cap engages around n=44
 
 
 def _radius_for_n_routes(n_routes: int) -> float:
-    """Pixel radius for an area's blob, scaled so blob area ∝ route count."""
+    """Geographic radius (metres) for an area's blob, with area ∝ route count."""
     n = max(1, int(n_routes))
-    raw = BLOB_RADIUS_SCALE * math.sqrt(n)
-    return max(MIN_BLOB_RADIUS, min(MAX_BLOB_RADIUS, raw))
+    raw = BLOB_RADIUS_SCALE_M * math.sqrt(n)
+    return max(MIN_BLOB_RADIUS_M, min(MAX_BLOB_RADIUS_M, raw))
 
 
 # ---------------------------------------------------------------------------
@@ -1052,12 +1059,28 @@ class _BlobsCanvasLayer(MacroElement):
                     for (var i = 0; i < blobs.length; i++) {
                         var b = blobs[i];
                         var lat = b[0], lon = b[1];
-                        var radius = b[2];
+                        // b[2] is the blob's radius in METRES (set in Python).
+                        // Convert to pixels at the current zoom so the blob
+                        // covers a fixed *geographic* area rather than a
+                        // fixed screen size -- otherwise at low zoom the
+                        // blob would bleed across whole states.
+                        var radiusMetres = b[2];
                         if (lat < bounds.getSouth() || lat > bounds.getNorth()
                          || lon < bounds.getWest()  || lon > bounds.getEast()) {
                             continue;
                         }
                         var p = map.latLngToContainerPoint([lat, lon]);
+                        // 1 deg longitude ≈ 111320 m * cos(lat). Offset the
+                        // centre by that many degrees east, project both
+                        // points, and the pixel delta is the radius in
+                        // pixels at this zoom level and latitude.
+                        var metresPerDegLng =
+                            111320 * Math.cos(lat * Math.PI / 180);
+                        var dLng = radiusMetres / metresPerDegLng;
+                        var pEdge = map.latLngToContainerPoint([lat, lon + dLng]);
+                        var radius = Math.abs(pEdge.x - p.x);
+                        // Sub-pixel blobs would just produce noise; skip.
+                        if (radius < 1) { continue; }
                         var rgb = b[rgbOffset] + ',' + b[rgbOffset + 1] + ','
                                 + b[rgbOffset + 2];
                         var grad = ctx.createRadialGradient(
