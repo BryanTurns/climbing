@@ -871,25 +871,49 @@ def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
 # so the *area* of the blob (which is what the eye perceives as "size") is
 # proportional to the route count rather than its radius — otherwise a
 # 100-route crag would render with 100x the visual mass of a 1-route one and
-# swamp the map. Bounds keep tiny areas legible and stop a single mega-area
-# from eating the whole viewport.
+# swamp the map.
 #
-# Radii are expressed in METRES, not pixels, so blobs shrink on screen as the
-# user zooms out. A pixel radius would stay the same screen size at every
-# zoom, which made country-level views misleading: a 30 px blob covers tens
-# of miles at zoom 5, so empty states looked colored. The canvas layer
-# converts metres to pixels per redraw using the map's current projection.
+# Each blob carries TWO radii and the JS draws at ``min(target_px,
+# geographic_px)``:
+#
+# * ``target_px`` — a zoom-independent pixel size from sqrt(n_routes). At
+#   high zoom this wins, so a 200-route crag visibly out-sizes a 50-route
+#   crag (preserving rank-by-routes where the user can actually read it).
+# * ``radius_m``  — a geographic ceiling in metres. As you zoom out, the
+#   pixel equivalent of this distance shrinks; once it drops below
+#   ``target_px``, it clips the blob. That stops a single crag from
+#   "covering" empty states like Idaho at country zoom.
+#
+# Both knobs are independent: tune the pixel range to control rank
+# resolution at close zoom; tune the geographic ceiling to control how
+# soon big blobs get crushed as you pull back.
 _METRES_PER_MILE = 1609.344
-MIN_BLOB_RADIUS_M = 1 * _METRES_PER_MILE      # ~1 mi floor so 1-route areas are visible at mid zoom
-MAX_BLOB_RADIUS_M = 10 * _METRES_PER_MILE     # ~10 mi cap so big crags don't bleed across state lines
+
+# Pixel target (sqrt-scaled by n_routes, zoom-independent).
+MIN_BLOB_RADIUS_PX = 30      # floor so 1-route areas stay visible
+MAX_BLOB_RADIUS_PX = 140     # cap so a 500-route crag doesn't dominate
+BLOB_RADIUS_SCALE_PX = 22    # multiplier on sqrt(n_routes)
+
+# Geographic ceiling (metres). The pixel-equivalent of this distance is
+# the upper bound on a blob's screen radius.
+MIN_BLOB_RADIUS_M = 1 * _METRES_PER_MILE      # ~1 mi
+MAX_BLOB_RADIUS_M = 10 * _METRES_PER_MILE     # ~10 mi
 BLOB_RADIUS_SCALE_M = 1.5 * _METRES_PER_MILE  # ~1.5 mi · sqrt(n_routes); cap engages around n=44
 
 
-def _radius_for_n_routes(n_routes: int) -> float:
-    """Geographic radius (metres) for an area's blob, with area ∝ route count."""
+def _radius_for_n_routes(n_routes: int) -> tuple[float, float]:
+    """Return ``(radius_metres, target_px)`` for an area with ``n_routes``."""
     n = max(1, int(n_routes))
-    raw = BLOB_RADIUS_SCALE_M * math.sqrt(n)
-    return max(MIN_BLOB_RADIUS_M, min(MAX_BLOB_RADIUS_M, raw))
+    sqrt_n = math.sqrt(n)
+    radius_m = max(
+        MIN_BLOB_RADIUS_M,
+        min(MAX_BLOB_RADIUS_M, BLOB_RADIUS_SCALE_M * sqrt_n),
+    )
+    target_px = max(
+        MIN_BLOB_RADIUS_PX,
+        min(MAX_BLOB_RADIUS_PX, BLOB_RADIUS_SCALE_PX * sqrt_n),
+    )
+    return radius_m, target_px
 
 
 # ---------------------------------------------------------------------------
@@ -913,14 +937,18 @@ class _BlobsCanvasLayer(MacroElement):
     b]`` triple per ``(metric, aggregation_method)`` combination, in
     metric-outer, aggregation-inner order matching :data:`METRICS` and
     :data:`AGGREGATION_METHODS`. With M metrics and A methods that's
-    ``3 + M*A*3`` floats per blob. For example with 2 metrics × 2
+    ``4 + M*A*3`` floats per blob. For example with 2 metrics × 2
     methods::
 
-        [lat, lon, radius,
+        [lat, lon, radius_m, target_px,
          diff_mean_r,    diff_mean_g,    diff_mean_b,
          diff_median_r,  diff_median_g,  diff_median_b,
          pop_mean_r,     pop_mean_g,     pop_mean_b,
          pop_median_r,   pop_median_g,   pop_median_b]
+
+    The paint loop computes ``geographic_px`` (the pixel-equivalent of
+    ``radius_m`` at the current zoom) and draws at ``min(target_px,
+    geographic_px)``. See :func:`_radius_for_n_routes` for the rationale.
 
     Which triple is drawn is decided at paint time by the active values
     on ``window.__heatmapMetricState`` and ``window.__heatmapAggState``.
@@ -940,11 +968,11 @@ class _BlobsCanvasLayer(MacroElement):
             var map        = {{ this._parent.get_name() }};
 
             // Index of the colour triple inside each blob entry for a
-            // given (metric, agg) pair. Triples are laid out in the
-            // same order Python emitted them: metric-outer,
-            // agg-inner. So with 2 metrics × 2 methods,
-            // (metric=0, agg=0) lives at 3..5, (0, 1) at 6..8,
-            // (1, 0) at 9..11, (1, 1) at 12..14.
+            // given (metric, agg) pair. The first 4 slots are header
+            // fields (lat, lon, radius_m, target_px); triples follow in
+            // metric-outer, agg-inner order. So with 2 metrics × 2
+            // methods, (metric=0, agg=0) lives at 4..6, (0, 1) at 7..9,
+            // (1, 0) at 10..12, (1, 1) at 13..15.
             var metricIdxByKey = {};
             for (var m = 0; m < metricKeys.length; m++) {
                 metricIdxByKey[metricKeys[m]] = m;
@@ -958,7 +986,7 @@ class _BlobsCanvasLayer(MacroElement):
                 var a = aggIdxByKey[aggKey];
                 if (m === undefined) m = 0;
                 if (a === undefined) a = 0;
-                return 3 + (m * aggKeys.length + a) * 3;
+                return 4 + (m * aggKeys.length + a) * 3;
             }
 
             var BlobsLayer = L.Layer.extend({
@@ -1059,12 +1087,15 @@ class _BlobsCanvasLayer(MacroElement):
                     for (var i = 0; i < blobs.length; i++) {
                         var b = blobs[i];
                         var lat = b[0], lon = b[1];
-                        // b[2] is the blob's radius in METRES (set in Python).
-                        // Convert to pixels at the current zoom so the blob
-                        // covers a fixed *geographic* area rather than a
-                        // fixed screen size -- otherwise at low zoom the
-                        // blob would bleed across whole states.
+                        // Two radii per blob (see _radius_for_n_routes):
+                        //   b[2] = radius_m   — geographic ceiling
+                        //   b[3] = target_px  — pixel size from sqrt(n_routes)
+                        // We draw at min(target_px, geographic_px). At high
+                        // zoom target_px wins (preserves rank-by-routes);
+                        // at low zoom the geographic ceiling crushes blobs
+                        // so they don't cover empty states.
                         var radiusMetres = b[2];
+                        var targetPx     = b[3];
                         if (lat < bounds.getSouth() || lat > bounds.getNorth()
                          || lon < bounds.getWest()  || lon > bounds.getEast()) {
                             continue;
@@ -1072,13 +1103,14 @@ class _BlobsCanvasLayer(MacroElement):
                         var p = map.latLngToContainerPoint([lat, lon]);
                         // 1 deg longitude ≈ 111320 m * cos(lat). Offset the
                         // centre by that many degrees east, project both
-                        // points, and the pixel delta is the radius in
-                        // pixels at this zoom level and latitude.
+                        // points, and the pixel delta is the geographic
+                        // radius in pixels at this zoom and latitude.
                         var metresPerDegLng =
                             111320 * Math.cos(lat * Math.PI / 180);
                         var dLng = radiusMetres / metresPerDegLng;
                         var pEdge = map.latLngToContainerPoint([lat, lon + dLng]);
-                        var radius = Math.abs(pEdge.x - p.x);
+                        var geographicPx = Math.abs(pEdge.x - p.x);
+                        var radius = Math.min(targetPx, geographicPx);
                         // Sub-pixel blobs would just produce noise; skip.
                         if (radius < 1) { continue; }
                         var rgb = b[rgbOffset] + ',' + b[rgbOffset + 1] + ','
@@ -1422,8 +1454,8 @@ def _populate_climb_type_layer(
     # so the canvas layer's offset lookup lines up.
     blobs: list[list[float]] = []
     for row in rows:
-        radius = _radius_for_n_routes(row["n_routes"])
-        entry: list[float] = [row["lat"], row["lon"], radius]
+        radius_m, target_px = _radius_for_n_routes(row["n_routes"])
+        entry: list[float] = [row["lat"], row["lon"], radius_m, target_px]
         for metric in METRICS:
             colormap, scale_min, scale_max = colormaps_by_metric[metric.key]
             for method in AGGREGATION_METHODS:
