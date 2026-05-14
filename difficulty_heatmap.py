@@ -45,6 +45,7 @@ The output is written to ``route_difficulty_heatmap.html``.
 
 from __future__ import annotations
 
+import html
 import json
 import math
 import re
@@ -749,10 +750,24 @@ def aggregate_by_area(
             continue
         n = len(scores)
         total_views = pop_total_by_id[area_id]
+        # Pre-bake the popup-facing name as an HTML anchor pointing at the
+        # area's Mountain Project page. folium's GeoJsonPopup interpolates
+        # field values straight into innerHTML, so the link renders inline
+        # without any extra JS. We escape both halves so weird names or
+        # URLs can't break the markup.
+        area_url = area.get("link")
+        escaped_name = html.escape(area["name"])
+        if area_url:
+            name_html = (
+                f'<a href="{html.escape(area_url, quote=True)}"'
+                f' target="_blank" rel="noopener">{escaped_name}</a>'
+            )
+        else:
+            name_html = escaped_name
         rows.append(
             {
                 "id": area_id,
-                "name": area["name"],
+                "name": name_html,
                 "lat": area["gps"]["lat"],
                 "lon": area["gps"]["lon"],
                 "n_routes": n,
