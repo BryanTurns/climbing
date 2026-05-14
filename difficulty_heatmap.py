@@ -1114,6 +1114,156 @@ class _MetricState(MacroElement):
         self.default_key = default_key
 
 
+# ---------------------------------------------------------------------------
+# Points toggle: shared state + UI control.
+# ---------------------------------------------------------------------------
+#
+# The click-target dots (one ``folium.GeoJson`` per climb-type FeatureGroup)
+# are useful when you want to inspect a specific area, but they clutter the
+# view when you just want to read the colour blobs.  This pub/sub state +
+# checkbox control flips their visibility globally.  Per-FeatureGroup GeoJson
+# layers subscribe via :class:`_PointsSubscriber` and apply ``setStyle`` so
+# the dots collapse to ``radius: 0`` (invisible AND not click-targets) when
+# the user unchecks the box.  Toggling survives base-layer (climb-type)
+# changes because the state lives on ``window`` and each newly-shown
+# GeoJson re-applies the current state on add.
+
+class _PointsState(MacroElement):
+    """Inject a pub/sub state holder for the points (dots) visibility.
+
+    Mirrors :class:`_MetricState` so any number of GeoJson dot layers --
+    one per climb-type FeatureGroup -- can stay in sync with a single
+    checkbox without knowing about each other.
+    """
+
+    _name = "PointsState"
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function () {
+            if (window.__heatmapPointsState) { return; }
+            var visible = {{ this.default_visible | tojson }};
+            var subs = [];
+            window.__heatmapPointsState = {
+                get: function () { return visible; },
+                set: function (next) {
+                    if (next === visible) { return; }
+                    visible = next;
+                    for (var i = 0; i < subs.length; i++) {
+                        try { subs[i](visible); } catch (e) { /* ignore */ }
+                    }
+                },
+                subscribe: function (fn) {
+                    subs.push(fn);
+                    return function () {
+                        var idx = subs.indexOf(fn);
+                        if (idx !== -1) { subs.splice(idx, 1); }
+                    };
+                }
+            };
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(self, default_visible: bool) -> None:
+        super().__init__()
+        self.default_visible = default_visible
+
+
+class _PointsToggle(MacroElement):
+    """Render a checkbox that flips ``window.__heatmapPointsState``.
+
+    Sits below the View radio in the top-right stack, matching the
+    other controls' styling.
+    """
+
+    _name = "PointsToggle"
+
+    _template = Template(
+        """
+        {% macro html(this, kwargs) %}
+        <div class="points-toggle" style="
+            position: fixed;
+            top: 290px;
+            right: 10px;
+            background: rgba(255,255,255,0.95);
+            padding: 8px 12px;
+            border: 2px solid rgba(0,0,0,0.2);
+            border-radius: 4px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+            z-index: 1000;
+            font-family: sans-serif;
+            font-size: 13px;
+            color: #222;
+        ">
+            <div style="font-weight:bold;margin-bottom:4px;">Markers</div>
+            <label style="display:block;cursor:pointer;line-height:1.6;">
+                <input type="checkbox"
+                       class="points-toggle-checkbox"
+                       {% if this.default_visible %}checked{% endif %}
+                       style="margin-right:6px;vertical-align:middle;">
+                Show points
+            </label>
+        </div>
+        {% endmacro %}
+
+        {% macro script(this, kwargs) %}
+        (function () {
+            var inputs = document.querySelectorAll(
+                '.points-toggle .points-toggle-checkbox'
+            );
+            inputs.forEach(function (el) {
+                el.addEventListener('change', function () {
+                    window.__heatmapPointsState.set(el.checked);
+                });
+            });
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(self, default_visible: bool) -> None:
+        super().__init__()
+        self.default_visible = default_visible
+
+
+class _PointsSubscriber(MacroElement):
+    """Wire a parent ``folium.GeoJson`` dot layer to the points state.
+
+    Added as a child of each climb-type's GeoJson so the template's
+    ``this._parent.get_name()`` resolves to the GeoJson's JS variable.
+    On state change we call ``setStyle`` with either the live style or
+    ``radius: 0`` (which also drops the click hit area, so invisible
+    dots aren't accidentally clickable).
+    """
+
+    _name = "PointsSubscriber"
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function () {
+            var layer = {{ this._parent.get_name() }};
+            function apply(visible) {
+                layer.setStyle({
+                    radius: visible ? 3 : 0,
+                    opacity: visible ? 1 : 0,
+                    fillOpacity: visible ? 0.85 : 0
+                });
+            }
+            window.__heatmapPointsState.subscribe(apply);
+            // Apply current state immediately so a layer that's added
+            // after the user has already unchecked the box doesn't
+            // briefly show its dots before catching up.
+            apply(window.__heatmapPointsState.get());
+        })();
+        {% endmacro %}
+        """
+    )
+
+
 class _MetricToggle(MacroElement):
     """Render a small radio control that flips ``window.__heatmapMetricState``.
 
@@ -1279,7 +1429,7 @@ def _populate_climb_type_layer(
             }
         )
 
-    folium.GeoJson(
+    points_layer = folium.GeoJson(
         {"type": "FeatureCollection", "features": features},
         marker=folium.CircleMarker(
             radius=3,
@@ -1298,7 +1448,12 @@ def _populate_climb_type_layer(
             max_width=320,
             localize=False,
         ),
-    ).add_to(feature_group)
+    )
+    points_layer.add_to(feature_group)
+    # Subscribe this climb type's dots to the global points-visibility
+    # state. Added as a child of the GeoJson so the subscriber's template
+    # can reference the GeoJson's JS variable via ``this._parent``.
+    points_layer.add_child(_PointsSubscriber())
 
 
 def build_heatmap(
@@ -1370,6 +1525,11 @@ def build_heatmap(
     # before the layer control is wired up — so the state object has
     # to exist by then.
     fmap.add_child(_MetricState(DEFAULT_METRIC.key))
+    # Same ordering rule for the points-visibility state: each
+    # FeatureGroup's GeoJson layer registers a _PointsSubscriber that
+    # reads the state at add time, so the state object must already
+    # exist when the default base layer attaches.
+    fmap.add_child(_PointsState(default_visible=True))
 
     # One FeatureGroup per active climb type, registered as a *base layer*
     # (overlay=False) so folium's LayerControl renders them as a
@@ -1402,6 +1562,11 @@ def build_heatmap(
     fmap.add_child(
         _MetricToggle(METRICS, DEFAULT_METRIC.key),
     )
+
+    # Points-visibility checkbox sits below the View radio.  Flipping
+    # it pushes the new boolean into ``window.__heatmapPointsState``,
+    # which every climb type's GeoJson dot layer is subscribed to.
+    fmap.add_child(_PointsToggle(default_visible=True))
 
     # Render every (climb_type, view) combination's legend in the
     # same fixed position; only the default-default starts visible.
