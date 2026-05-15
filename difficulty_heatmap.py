@@ -57,7 +57,6 @@ import folium
 from branca.element import MacroElement
 from jinja2 import Template
 
-
 # ---------------------------------------------------------------------------
 # Schema version this build of the heatmap consumes
 # ---------------------------------------------------------------------------
@@ -210,7 +209,7 @@ V_GRADE_RE = re.compile(
     re.VERBOSE,
 )
 
-V_MIN_NUMERIC = -4          # VB sits one full grade below V0
+V_MIN_NUMERIC = -4  # VB sits one full grade below V0
 # V17 is the hardest established boulder grade.  We pad the upper bound
 # by the same 3-slot offset YDS uses for its trailing "d" letter so that
 # bare ``V17`` (= 17*4 + 1.5, the middle of the V17 band) and ``V17+``
@@ -287,10 +286,11 @@ def numeric_to_v_grade(score: float | None) -> str:
 # appending another entry to ``CLIMB_TYPES`` (and providing grade
 # conversion functions if it doesn't share an existing scale).
 
+
 @dataclass
 class ClimbTypeConfig:
-    label: str                                            # display name
-    type_token: str                                       # MP route ``type`` token
+    label: str  # display name
+    type_token: str  # MP route ``type`` token
     # Which grade field on a route record this climb type reads. Sport
     # and Trad pull from ``yds_grade``; Boulder pulls from
     # ``boulder_grade``. Routes that carry both (e.g. a hard sport climb
@@ -299,10 +299,10 @@ class ClimbTypeConfig:
     grade_field: str
     grade_to_numeric: Callable[[str | None], float | None]
     numeric_to_grade: Callable[[float | None], str]
-    scale_min_grade: str                                  # colormap vmin
-    scale_max_grade: str                                  # colormap vmax
-    tick_grades: list[str]                                # legend tick labels
-    legend_subtitle: str                                  # legend header text
+    scale_min_grade: str  # colormap vmin
+    scale_max_grade: str  # colormap vmax
+    tick_grades: list[str]  # legend tick labels
+    legend_subtitle: str  # legend header text
 
 
 # All three rope disciplines share the same focused band and tick grades.
@@ -316,15 +316,21 @@ class ClimbTypeConfig:
 ROPE_SCALE_MIN = "5.7"
 ROPE_SCALE_MAX = "5.14d"
 ROPE_TICK_GRADES = [
-    "5.7", "5.8", "5.9", "5.10a", "5.11a",
-    "5.12a", "5.13a", "5.14a", "5.14d",
+    "5.7",
+    "5.8",
+    "5.9",
+    "5.10a",
+    "5.11a",
+    "5.12a",
+    "5.13a",
+    "5.14a",
+    "5.14d",
 ]
 
 
 def _rope_legend_subtitle(discipline: str) -> str:
     return (
-        f"Median {discipline} difficulty per area "
-        f"({ROPE_SCALE_MIN}–{ROPE_SCALE_MAX})"
+        f"Median {discipline} difficulty per area ({ROPE_SCALE_MIN}–{ROPE_SCALE_MAX})"
     )
 
 
@@ -519,10 +525,10 @@ def _format_views(views: int) -> str:
 
 @dataclass
 class MetricConfig:
-    key: str                                       # state key in JS ("difficulty", "popularity_total", ...)
-    label: str                                     # display label on the toggle
-    palette: list[str]                             # gradient colours (cool → hot)
-    row_field: str                                 # column name on each row dict
+    key: str  # state key in JS ("difficulty", "popularity_total", ...)
+    label: str  # display label on the toggle
+    palette: list[str]  # gradient colours (cool → hot)
+    row_field: str  # column name on each row dict
     # Pull this view's per-route value off a route record.  Returns
     # ``None`` for routes that don't contribute (e.g. an unparseable
     # grade for the difficulty view).
@@ -546,9 +552,7 @@ class MetricConfig:
 
 # Difficulty metric: per-route grade → numeric score, with the per-climb-type
 # scale and tick grades already configured on ``ClimbTypeConfig``.
-def _difficulty_route_value(
-    route: dict, climb_type: ClimbTypeConfig
-) -> float | None:
+def _difficulty_route_value(route: dict, climb_type: ClimbTypeConfig) -> float | None:
     return climb_type.grade_to_numeric(route.get(climb_type.grade_field))
 
 
@@ -571,7 +575,7 @@ DIFFICULTY = MetricConfig(
     palette=DIFFICULTY_COLOURS,
     row_field="difficulty",
     route_value=_difficulty_route_value,
-    aggregated_to_score=lambda x: x,                    # already numeric
+    aggregated_to_score=lambda x: x,  # already numeric
     scale_bounds_for=_scale_bounds,
     ticks_for=_difficulty_ticks,
     subtitle_for=lambda ct: ct.legend_subtitle,
@@ -593,9 +597,7 @@ DIFFICULTY = MetricConfig(
 #
 # Both share the palette, log transform, and tick-format helpers; only
 # the scale bounds and tick lists differ.
-def _popularity_route_value(
-    route: dict, _climb_type: ClimbTypeConfig
-) -> float | None:
+def _popularity_route_value(route: dict, _climb_type: ClimbTypeConfig) -> float | None:
     views = route.get("page_views_per_month")
     if views is None:
         # Treat missing as zero rather than dropping the route -- a
@@ -622,6 +624,7 @@ def _make_popularity_metric(
     they differ only in scale bounds, tick list, and the subtitle's
     leading word ("Total" / "Average").
     """
+
     def scale_bounds_for(_ct: ClimbTypeConfig) -> tuple[float, float]:
         return (_to_pop_score(scale_min_views), _to_pop_score(scale_max_views))
 
@@ -680,9 +683,8 @@ DEFAULT_METRIC = METRICS[0]
 # Aggregation
 # ---------------------------------------------------------------------------
 
-def aggregate_by_area(
-    payload: dict, climb_type: ClimbTypeConfig
-) -> list[dict]:
+
+def aggregate_by_area(payload: dict, climb_type: ClimbTypeConfig) -> list[dict]:
     """Aggregate a climb type's per-route metrics per area, attaching GPS coords.
 
     Every view's value is precomputed and stored on each row so the
@@ -737,9 +739,8 @@ def aggregate_by_area(
         # sport route doesn't quietly inflate the area's popularity.
         # ``_popularity_route_value`` returns 0.0 for missing views so
         # we can sum unconditionally.
-        pop_total_by_id[area_id] = (
-            pop_total_by_id.get(area_id, 0.0)
-            + (_popularity_route_value(route, climb_type) or 0.0)
+        pop_total_by_id[area_id] = pop_total_by_id.get(area_id, 0.0) + (
+            _popularity_route_value(route, climb_type) or 0.0
         )
 
     rows: list[dict] = []
@@ -812,15 +813,17 @@ def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
 _METRES_PER_MILE = 1609.344
 
 # Pixel target (sqrt-scaled by n_routes, zoom-independent).
-MIN_BLOB_RADIUS_PX = 40      # floor so 1-route areas stay visible
-MAX_BLOB_RADIUS_PX = 140     # cap so a 500-route crag doesn't dominate
-BLOB_RADIUS_SCALE_PX = 22    # multiplier on sqrt(n_routes)
+MIN_BLOB_RADIUS_PX = 40  # floor so 1-route areas stay visible
+MAX_BLOB_RADIUS_PX = 140  # cap so a 500-route crag doesn't dominate
+BLOB_RADIUS_SCALE_PX = 22  # multiplier on sqrt(n_routes)
 
 # Geographic ceiling (metres). The pixel-equivalent of this distance is
 # the upper bound on a blob's screen radius.
-MIN_BLOB_RADIUS_M = 1 * _METRES_PER_MILE      # ~1 mi
-MAX_BLOB_RADIUS_M = 20 * _METRES_PER_MILE     # ~10 mi
-BLOB_RADIUS_SCALE_M = 3 * _METRES_PER_MILE  # ~1.5 mi · sqrt(n_routes); cap engages around n=44
+MIN_BLOB_RADIUS_M = 1 * _METRES_PER_MILE  # ~1 mi
+MAX_BLOB_RADIUS_M = 20 * _METRES_PER_MILE  # ~10 mi
+BLOB_RADIUS_SCALE_M = (
+    3 * _METRES_PER_MILE
+)  # ~1.5 mi · sqrt(n_routes); cap engages around n=44
 
 
 def _radius_for_n_routes(n_routes: int) -> tuple[float, float]:
@@ -1061,6 +1064,7 @@ class _BlobsCanvasLayer(MacroElement):
 # emits the state object once into the page; ``_MetricToggle`` adds the
 # small radio control that flips it.
 
+
 class _MetricState(MacroElement):
     """Inject a tiny pub/sub state holder for the active view.
 
@@ -1174,7 +1178,9 @@ class _MetricToggle(MacroElement):
     )
 
     def __init__(
-        self, metrics: list[MetricConfig], default_key: str,
+        self,
+        metrics: list[MetricConfig],
+        default_key: str,
     ) -> None:
         super().__init__()
         self.metrics = metrics
@@ -1211,7 +1217,9 @@ def _populate_climb_type_layer(
     for metric in METRICS:
         scale_min, scale_max = metric.scale_bounds_for(climb_type)
         colormap = cm.LinearColormap(
-            metric.palette, vmin=scale_min, vmax=scale_max,
+            metric.palette,
+            vmin=scale_min,
+            vmax=scale_max,
         )
         colormaps_by_metric[metric.key] = (colormap, scale_min, scale_max)
 
@@ -1235,7 +1243,9 @@ def _populate_climb_type_layer(
         for metric in METRICS:
             colormap, scale_min, scale_max = colormaps_by_metric[metric.key]
             bucket = _quantize_to_bucket(
-                row[metric.row_field], scale_min, scale_max,
+                row[metric.row_field],
+                scale_min,
+                scale_max,
             )
             r, g, b = _hex_to_rgb(colormap(bucket))
             entry.extend((r, g, b))
@@ -1260,8 +1270,7 @@ def _populate_climb_type_layer(
         min_grade = climb_type.numeric_to_grade(row["min_difficulty"])
         max_grade = climb_type.numeric_to_grade(row["max_difficulty"])
         grade_range = (
-            min_grade if min_grade == max_grade
-            else f"{min_grade} – {max_grade}"
+            min_grade if min_grade == max_grade else f"{min_grade} – {max_grade}"
         )
         features.append(
             {
@@ -1292,8 +1301,10 @@ def _populate_climb_type_layer(
         popup=folium.GeoJsonPopup(
             fields=["name", "n_routes", "median_grade", "range"],
             aliases=[
-                "Area", f"{climb_type.label} routes",
-                "Median grade", "Range",
+                "Area",
+                f"{climb_type.label} routes",
+                "Median grade",
+                "Range",
             ],
             max_width=320,
             localize=False,
@@ -1308,9 +1319,7 @@ def build_heatmap(
 ) -> Path:
     """Render the multi-climb-type heatmap to a single HTML file."""
     if not any(rows_by_type.get(ct.label) for ct in climb_types):
-        raise ValueError(
-            "No areas with valid grades were found in any climb type."
-        )
+        raise ValueError("No areas with valid grades were found in any climb type.")
 
     # Skip climb types that have zero rows so the radio toggle doesn't show
     # an empty option.  Order is preserved (Sport → Trad → Boulder), so the
@@ -1326,7 +1335,7 @@ def build_heatmap(
 
     fmap = folium.Map(
         location=[center_lat, center_lon],
-        zoom_start=14,
+        zoom_start=6,
         # Don't let folium auto-attach its default OSM tile layer: that
         # variant doesn't set a referrerPolicy, so depending on how the
         # HTML is loaded the browser sends no Referer header and OSM's
@@ -1384,7 +1393,9 @@ def build_heatmap(
             show=(ct is default_type),
         )
         _populate_climb_type_layer(
-            feature_group, rows_by_type[ct.label], ct,
+            feature_group,
+            rows_by_type[ct.label],
+            ct,
         )
         feature_group.add_to(fmap)
 
@@ -1512,9 +1523,7 @@ def _build_legend_html(
         pct = (score - scale_min) / span * 100
         ticks.append((label, pct))
 
-    gradient_css = (
-        f"linear-gradient(to right, {', '.join(metric.palette)})"
-    )
+    gradient_css = f"linear-gradient(to right, {', '.join(metric.palette)})"
 
     label_spans = "".join(
         (
@@ -1527,7 +1536,7 @@ def _build_legend_html(
     tick_marks = "".join(
         (
             f'<span style="position:absolute;left:{pct:.2f}%;top:0;'
-            f'width:1px;height:6px;background:#444;'
+            f"width:1px;height:6px;background:#444;"
             f'transform:translateX(-50%);"></span>'
         )
         for _, pct in ticks
@@ -1579,6 +1588,7 @@ def _build_legend_html(
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def load_all(data_dir: Path) -> Iterable[dict]:
     """Yield each payload under ``data_dir/v<SCHEMA_VERSION>/*.json``,
@@ -1656,7 +1666,9 @@ def main() -> None:
         )
 
     output = build_heatmap(
-        rows_by_type, "route_difficulty_heatmap.html", CLIMB_TYPES,
+        rows_by_type,
+        "route_difficulty_heatmap.html",
+        CLIMB_TYPES,
     )
     summary = ", ".join(
         f"{ct.label}: {len(rows_by_type[ct.label])}" for ct in CLIMB_TYPES
